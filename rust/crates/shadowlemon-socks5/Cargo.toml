@@ -1,0 +1,30 @@
+[package]
+name = "shadowlemon-socks5"
+description = "SOCKS5 inbound proxy for ShadowLemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+embedded = []
+android = []
+windows = []
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+ipnet.workspace = true
+rand.workspace = true
+shadowlemon-wire.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

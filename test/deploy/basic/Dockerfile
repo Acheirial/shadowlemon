@@ -15,30 +15,18 @@
 
 # Assume this file is executed with `docker build -f` from the root dir of shadowlemon project.
 
-FROM ubuntu:24.04
+FROM debian:bookworm-slim
 
 WORKDIR /test
 
-# Copy binaries, data and test script into the container.
+# Copy the prebuilt Rust binaries (produced by the Makefile test-binary target)
+# together with the scenario scripts and their JSON configurations. The image
+# contains no compiler and performs no build of its own.
 COPY bin/shadowlemon bin/httpserver bin/sockshttpclient bin/socksudpclient bin/udpserver \
-    test/deploy/basic/client_mix.json test/deploy/basic/server_mix.json \
-    test/deploy/basic/client_tcp.json test/deploy/basic/client_tcp_no_wait.json test/deploy/basic/server_tcp.json \
-    test/deploy/basic/client_udp.json test/deploy/basic/client_udp_no_wait.json test/deploy/basic/server_udp.json \
-    test/deploy/basic/client_aes.json test/deploy/basic/server_aes.json \
-    test/deploy/basic/client_aes_udp.json test/deploy/basic/server_aes_udp.json \
-    test/deploy/basic/client_suite_mismatch.json test/deploy/basic/server_suite_mismatch.json \
-    test/deploy/basic/libtest.sh test/deploy/basic/test_mix_udp_associate.sh \
-    test/deploy/basic/test_tcp.sh test/deploy/basic/test_udp.sh test/deploy/basic/test_aes.sh \
-    test/deploy/basic/test_aes_udp.sh test/deploy/basic/test_suite_mismatch.sh \
-    test/deploy/basic/test.sh /test/
+     test/deploy/basic/*.json test/deploy/basic/*.sh /test/
 
-# Create shadowlemon user and server config directory.
-RUN /usr/sbin/useradd --no-create-home --user-group shadowlemon && \
-    mkdir -p /etc/shadowlemon && \
-    chown -R shadowlemon:shadowlemon /etc/shadowlemon && \
-    chmod 775 /etc/shadowlemon && \
-    mkdir -p /var/run/shadowlemon && \
-    chown -R shadowlemon:shadowlemon /var/run/shadowlemon && \
-    chmod 777 /var/run/shadowlemon
+# The Rust server keeps its pidfile here; the scripts start several servers in
+# sequence, so the directory must exist and be writable in the container.
+RUN mkdir -p /var/run/shadowlemon && chmod 777 /var/run/shadowlemon
 
-CMD ["/test/test.sh"]
+ENTRYPOINT ["/bin/bash", "test.sh"]

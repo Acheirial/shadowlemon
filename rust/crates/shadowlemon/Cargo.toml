@@ -1,0 +1,41 @@
+[package]
+name = "shadowlemon"
+description = "ShadowLemon V0.2 command line client and server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Desktop/server builds accept the low-entropy mode used by the example
+# configurations. Use `--no-default-features --features embedded` for routers.
+default = ["low-entropy"]
+low-entropy = ["shadowlemon-app/low-entropy"]
+# Small single-binary build for routers and mobile devices: no egress/DNS,
+# no low-entropy nonce support and no verbose logging.
+embedded = ["shadowlemon-app/embedded"]
+android = ["shadowlemon-app/android"]
+windows = ["shadowlemon-app/windows"]
+
+[[bin]]
+name = "shadowlemon"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+shadowlemon-app.workspace = true
+shadowlemon-config.workspace = true
+shadowlemon-crypto.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

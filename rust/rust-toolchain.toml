@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned to the stable channel installed in the development environment and
+# used by CI (rustc 1.100.0, 2026-11-09).
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

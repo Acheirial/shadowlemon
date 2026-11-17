@@ -28,21 +28,21 @@ source ./libtest.sh
 # client_aes.json prefers it and falls back to CIPHER_SUITE_XCHACHA20_POLY1305,
 # so a successful session must have negotiated AES-256-GCM.
 #
-# The negotiation result is only observable in a log line, and that line is
-# written at DEBUG level by the client (pkg/protocol/session.go, message
-# "<session> handshake completed with protocol ShadowLemon V0.1 and cipher suite <suite>").
+# The negotiation result is observable in the client log: when a session is
+# attached to the TCP transport the Rust driver logs, at DEBUG level,
+# "TCP session established to StreamUnderlay{" with a `suite=<name>` field on
+# the same line (rust/crates/shadowlemon-protocol/src/driver.rs).
 # client_aes.json therefore sets "loggingLevel": "DEBUG"; with the "INFO" level
-# used by client_tcp.json the line is never emitted. The client writes its log
-# to $HOME/.cache/shadowlemon/<timestamp>_<pid>.log
-# (pkg/log/client_logging.go, log.NewClientLogFile()).
+# used by client_tcp.json the line is never emitted. start_client in libtest.sh
+# runs the client in the foreground and captures its log in
+# $HOME/.cache/shadowlemon/client.log.
 #
-# NOTE: only the client logs the negotiated suite. The server side
-# (Session.acceptHandshake) logs nothing when the handshake succeeds; it only
-# logs the reasons of a rejection, also at DEBUG level. server_aes.json is set
+# NOTE: only the client logs the negotiated suite. The server logs the reasons
+# of a rejection, but nothing when a handshake succeeds. server_aes.json is set
 # to DEBUG as well so that a rejection is visible in the container output.
-CLIENT_LOG_DIR="$HOME/.cache/shadowlemon"
-EXPECTED_AES_LINE="handshake completed with protocol ShadowLemon V0.1 and cipher suite AES_256_GCM"
-HANDSHAKE_LINE="handshake completed with protocol ShadowLemon V0.1 and cipher suite"
+AES_SUITE="AES_256_GCM"
+STREAM_UNDERLAY_LINE="to StreamUnderlay{"
+SESSION_ESTABLISHED_LINE="session established to"
 
 # count_client_log_matches <substring>
 # Prints how many lines of the client log contain the given substring.
@@ -53,6 +53,16 @@ function count_client_log_matches() {
     # "grep | wc -l" keeps this non-fatal when the log file is missing or no
     # line matches, so that "set -e" doesn't abort with an empty diagnostic.
     count=$(grep -h -F "$pattern" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | wc -l)
+    echo "$((count))"
+}
+
+# count_aes_stream_sessions
+# Number of established TCP sessions whose log line also carries the
+# AES_256_GCM suite field.
+function count_aes_stream_sessions() {
+    local count
+
+    count=$(grep -h -F "$STREAM_UNDERLAY_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | grep -F -c "$AES_SUITE" || true)
     echo "$((count))"
 }
 
@@ -72,34 +82,33 @@ function print_client_log_tail() {
 # this assertion is what tells the two cases apart.
 function assert_aes_cipher_suite_negotiated() {
     local aes_count
-    local handshake_count
+    local session_count
 
-    aes_count=$(count_client_log_matches "$EXPECTED_AES_LINE")
-    handshake_count=$(count_client_log_matches "$HANDSHAKE_LINE")
+    aes_count=$(count_aes_stream_sessions)
+    session_count=$(count_client_log_matches "$SESSION_ESTABLISHED_LINE")
 
     if [[ "$aes_count" -gt 0 ]]; then
         echo "cipher suite assertion passed: $aes_count session(s) negotiated AES_256_GCM."
-        grep -h -F "$EXPECTED_AES_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | head -n 3 || true
+        grep -h -F "$STREAM_UNDERLAY_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | grep -F "$AES_SUITE" | head -n 3 || true
         return 0
     fi
 
-    echo "cipher suite assertion FAILED: none of the $handshake_count completed session(s) used AES_256_GCM."
-    if [[ "$handshake_count" -gt 0 ]]; then
-        echo "the sessions completed the ShadowLemon V0.1 handshake with a different cipher suite."
-        echo "observed completed handshakes (the suite name is at the end of each line):"
-        grep -h -F "$HANDSHAKE_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | head -n 3 || true
+    echo "cipher suite assertion FAILED: none of the $session_count established session(s) used AES_256_GCM."
+    if [[ "$session_count" -gt 0 ]]; then
+        echo "the sessions were established with a different cipher suite:"
+        grep -h -F "$SESSION_ESTABLISHED_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | head -n 3 || true
         echo "a XCHACHA20_POLY1305 suite above means the client fell back to the default suite"
         echo "instead of using the AES-256-GCM suite both configurations ask for."
     else
-        echo "no client log line reports a completed ShadowLemon V0.1 handshake at all, so the"
-        echo "session either wasn't established or the client didn't log at DEBUG level."
+        echo "no client log line reports an established session at all, so the session either"
+        echo "wasn't established or the client didn't log at DEBUG level."
     fi
-    echo "the expected log line is written by pkg/protocol/session.go:"
-    echo "  handshake completed with protocol ShadowLemon V0.1 and cipher suite <suite>"
+    echo "the expected log line is written by rust/crates/shadowlemon-protocol/src/driver.rs:"
+    echo "  TCP session established to StreamUnderlay{ ... suite=AES_256_GCM ..."
     echo "help: check that server_aes.json sets cipherSuites to CIPHER_SUITE_AES_256_GCM,"
     echo "help: that client_aes.json sets profiles[0].cipherSuites and \"loggingLevel\": \"DEBUG\","
     echo "help: that the server allows a suite the client offers, and that the log doesn't"
-    echo "help: contain 'no common cipher suite with the server, the client offered'."
+    echo "help: contain 'no common cipher suite with the server'."
     print_client_log_tail 80
     print_client_log
     exit 1

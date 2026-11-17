@@ -24,21 +24,21 @@ set -e
 source ./libtest.sh
 
 # Replace server with mixed config.
-./shadowlemon server replace config server_mix.json
+"$TEST_BINARY" server replace config server_mix.json
 if [[ "$?" -ne 0 ]]; then
     echo "command 'shadowlemon server replace config server_mix.json' failed"
     exit 1
 fi
 echo "server config:"
-./shadowlemon server describe config
+"$TEST_BINARY" server describe config
 
 # Start the server daemon.
-./shadowlemon server start
+"$TEST_BINARY" server start
 if [[ "$?" -ne 0 ]]; then
     echo "command 'shadowlemon server start' failed"
     exit 1
 fi
-server_status=$(./shadowlemon server status)
+server_status=$("$TEST_BINARY" server status)
 echo "server status:"
 echo "$server_status"
 if [[ "$server_status" != *RUNNING* ]]; then
@@ -47,35 +47,36 @@ if [[ "$server_status" != *RUNNING* ]]; then
 fi
 
 # Replace client with mixed config.
-./shadowlemon client replace config client_mix.json
+"$TEST_BINARY" client replace config client_mix.json
 if [[ "$?" -ne 0 ]]; then
     echo "command 'shadowlemon client replace config client_mix.json' failed"
     exit 1
 fi
 sleep 1
-./shadowlemon client export config simple
+"$TEST_BINARY" client export config simple
 sleep 1
-./shadowlemon client export config > client.url.txt
-rm ~/.config/shadowlemon/client.conf.pb
+"$TEST_BINARY" client export config > client.url.txt
+# Remove the saved config before re-importing.
+rm -f ~/.config/shadowlemon/client.json
 sleep 1
 echo "client config before import:"
-./shadowlemon client describe config
+"$TEST_BINARY" client describe config
 sleep 1
 echo "client config URL:"
 cat client.url.txt
 sleep 1
-./shadowlemon client import config "$(cat client.url.txt)"
+"$TEST_BINARY" client import config "$(cat client.url.txt)"
 echo "client config after import:"
-./shadowlemon client describe config
+"$TEST_BINARY" client describe config
 sleep 1
 
 # Start the client.
-./shadowlemon client start
+"$TEST_BINARY" client start
 if [[ "$?" -ne 0 ]]; then
     echo "command 'shadowlemon client start' failed"
     exit 1
 fi
-client_status=$(./shadowlemon client status)
+client_status=$("$TEST_BINARY" client status)
 echo "client status:"
 echo "$client_status"
 if [[ "$client_status" != *RUNNING* ]]; then
@@ -96,13 +97,13 @@ if [ "$?" -ne "0" ]; then
 fi
 
 # Stop the client.
-./shadowlemon client stop
+"$TEST_BINARY" client stop
 if [[ "$?" -ne 0 ]]; then
     echo "command 'shadowlemon client stop' failed"
     exit 1
 fi
 sleep 1
-client_status=$(./shadowlemon client status)
+client_status=$("$TEST_BINARY" client status)
 echo "client status:"
 echo "$client_status"
 if [[ "$client_status" != *STOPPED* ]]; then
@@ -111,13 +112,13 @@ if [[ "$client_status" != *STOPPED* ]]; then
 fi
 
 # Stop the server daemon.
-./shadowlemon server stop
+"$TEST_BINARY" server stop
 if [[ "$?" -ne 0 ]]; then
     echo "command 'shadowlemon server stop' failed"
     exit 1
 fi
 sleep 1
-server_status=$(./shadowlemon server status)
+server_status=$("$TEST_BINARY" server status)
 echo "server status:"
 echo "$server_status"
 if [[ "$server_status" != *STOPPED* ]]; then

@@ -13,23 +13,27 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-ROOT=$(shell git rev-parse --show-toplevel)
 SHORT_SHA=$(shell git rev-parse --short HEAD)
 TEST_BINARY_PREREQ = test-binary
 # Tag of the container image used by the integration tests. It can be overridden
 # from the environment, e.g. by CI when the image is built by another tool.
 TEST_CONTAINER_IMAGE ?= shadowlemon_basic:${SHORT_SHA}
-BENCH_TIME ?= 10s
 FUZZ_TIME ?= 10s
-BENCH_PACKAGES ?= ./pkg/cipher ./pkg/common ./pkg/protocol ./pkg/protocol/serveruser
-FUZZ_PACKAGES ?= ./pkg/cipher ./pkg/protocol
+
+# PROTOCOL_VERSION: ShadowLemon V0.2 wire protocol version byte is 4 (V0.1 was
+# 3). V0.2 is wire-incompatible with every older release; both peers must run
+# the same version.
 
 # With .ONESHELL, each recipe is executed in a single shell instance.
 # This allows `cd` to affect subsequent commands in the same recipe.
 # .ONESHELL is supported in GNU Make version 3.82 and later.
 .ONESHELL:
 
-# Build the shadowlemon binary. The single binary serves both the client
+# Cargo installs its binaries into ~/.cargo/bin, which is not always on PATH
+# (notably in minimal CI images). Every recipe prepends that directory so the
+# targets work without requiring the caller to configure the shell first.
+
+# Build the release binary into bin/. The single binary serves both the client
 # (shadowlemon client <command>) and the server (shadowlemon server <command>).
 .PHONY: build
 build: bin
@@ -38,126 +42,70 @@ build: bin
 .PHONY: bin
 bin:
 	mkdir -p bin
-	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/shadowlemon cmd/shadowlemon/main.go
+	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && cargo build --release --bin shadowlemon
+	cp target/release/shadowlemon ../bin/shadowlemon
 
-# Compile go libraries and run unit tests.
-.PHONY: lib
-lib: fmt vet compile test
-
-# Compile go libraries without running the tests.
-.PHONY: compile
-compile:
-	CGO_ENABLED=0 go build -v ./...
-
-# Run unit tests with the race detector and generate the coverage report.
-# The race detector requires cgo, so CGO_ENABLED must be left at its default
-# (i.e. 1 where a C toolchain is available) for this command.
-# -count=1 disables the cached test results in GOCACHE, so a test result from a
-# previous run can never hide a failure.
+# Run all unit / integration tests in the Rust workspace.
 .PHONY: test
 test:
-	go test -race -count=1 -timeout=5m -coverprofile coverage.out ./...
-	go tool cover -html coverage.out -o coverage.html
+	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && cargo test --workspace
+
+# Compile all workspace crates without running the tests.
+.PHONY: compile
+compile:
+	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && cargo build --workspace
 
 # Format source code.
 .PHONY: fmt
 fmt:
-	CGO_ENABLED=0 go fmt ./...
+	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && cargo fmt --all
 
-# Verify that the source code is formatted. Unlike fmt, this fails instead of
-# rewriting the files, so it can be used as a CI gate.
+# Verify that the source code is formatted without rewriting it (CI gate).
 .PHONY: fmt-check
 fmt-check:
-	set -e
-	unformatted=$$(gofmt -l .)
-	if [ -n "$$unformatted" ]; then
-		echo "gofmt would reformat the following files:"
-		echo "$$unformatted"
-		exit 1
-	fi
+	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && cargo fmt --all -- --check
 
-# Run go vet.
+# Alias kept for compatibility: the Rust equivalent of "vet" is clippy.
 .PHONY: vet
-vet:
-	CGO_ENABLED=0 go vet ./...
+vet: clippy
 
-# Run golangci-lint.
+# Lint all Rust targets with warnings treated as errors (CI gate).
+.PHONY: clippy
+clippy:
+	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && cargo clippy --workspace --all-targets --all-features -- -D warnings
+
 .PHONY: lint
-lint:
-	golangci-lint run ./...
+lint: clippy
 
-# Run benchmark.
+# Run benchmarks.
 .PHONY: bench
 bench:
-	CGO_ENABLED=0 go test -count=1 -run='^$$' -bench=. -benchtime=${BENCH_TIME} ${BENCH_PACKAGES}
+	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && cargo bench --workspace
 
-# Run fuzz tests.
+# Run every cargo-fuzz target for FUZZ_TIME (default 10s).
+# Requires nightly and cargo-fuzz.
 .PHONY: fuzz
 fuzz:
-	set -e
-	for pkg in ${FUZZ_PACKAGES}; do
-		fuzz_tests=$$(CGO_ENABLED=0 go test -list='^Fuzz' "$$pkg")
-		for fuzz_test in $$fuzz_tests; do
-			case "$$fuzz_test" in
-				Fuzz*)
-					echo "Running $$fuzz_test"
-					CGO_ENABLED=0 go test -run='^$$' -fuzz="^$${fuzz_test}$$" -fuzztime=${FUZZ_TIME} "$$pkg"
-					;;
-			esac
-		done
-	done
+	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && for target in $$(cargo fuzz list); do cargo fuzz run "$$target" -- -max_total_time=${FUZZ_TIME}; done
 
-# List the fuzz targets of FUZZ_PACKAGES as a JSON array, used to build the
-# matrix of the fuzzing workflow. It fails when a package does not compile or
-# when it has no fuzz target, so the matrix can never silently shrink.
-# Example output: [{"pkg":"./pkg/protocol","target":"FuzzLowEntropyRoundTrip"}]
-.PHONY: fuzz-matrix
-fuzz-matrix:
-	set -e
-	printf '['
-	first=1
-	for pkg in ${FUZZ_PACKAGES}; do
-		fuzz_tests=$$(CGO_ENABLED=0 go test -list='^Fuzz' "$$pkg" | grep '^Fuzz' || true)
-		if [ -z "$$fuzz_tests" ]; then
-			echo "no fuzz target found in $$pkg" >&2
-			exit 1
-		fi
-		for fuzz_test in $$fuzz_tests; do
-			if [ "$$first" -eq 0 ]; then
-				printf ','
-			fi
-			first=0
-			printf '{"pkg":"%s","target":"%s"}' "$$pkg" "$$fuzz_test"
-		done
-	done
-	printf ']\n'
+# List the cargo-fuzz targets. Requires nightly and cargo-fuzz.
+.PHONY: fuzz-list
+fuzz-list:
+	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && cargo fuzz list
 
-# Run a single fuzz target, used by the fuzzing workflow matrix.
-# Example: make fuzz-one PKG=./pkg/protocol FUZZ=FuzzLowEntropyRoundTrip
-.PHONY: fuzz-one
-fuzz-one:
-	set -e
-	if [ -z "${PKG}" ] || [ -z "${FUZZ}" ]; then
-		echo "usage: make fuzz-one PKG=<package> FUZZ=<fuzz target>"
-		exit 1
-	fi
-	CGO_ENABLED=0 go test -run='^$$' -fuzz="^${FUZZ}$$" -fuzztime=${FUZZ_TIME} "${PKG}"
+# Size-optimized embedded build: uses the `embedded` profile and feature.
+# Add --target <triple> for cross compilation (see rust/docs/platform-notes.md).
+.PHONY: rust-embedded
+rust-embedded:
+	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && cargo build --profile embedded --no-default-features --features embedded
 
-# Generate vendor directory.
-.PHONY: vendor
-vendor:
-	go mod tidy
-	go mod vendor
-
-# Build binaries used in integration tests.
+# Build binaries used in integration tests: the main binary plus the four
+# helpers (httpserver, udpserver, sockshttpclient, socksudpclient) provided by
+# the rust/test-utils crate. All five are placed in bin/.
 .PHONY: test-binary
-test-binary:
-	mkdir -p bin
-	CGO_ENABLED=0 go build -o bin/shadowlemon cmd/shadowlemon/main.go
-	CGO_ENABLED=0 go build -o bin/httpserver test/cmd/httpserver/httpserver.go
-	CGO_ENABLED=0 go build -o bin/sockshttpclient test/cmd/sockshttpclient/sockshttpclient.go
-	CGO_ENABLED=0 go build -o bin/socksudpclient test/cmd/socksudpclient/socksudpclient.go
-	CGO_ENABLED=0 go build -o bin/udpserver test/cmd/udpserver/udpserver.go
+test-binary: bin
+	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && cargo build --release --manifest-path test-utils/Cargo.toml --bins --target-dir target
+	cp target/release/httpserver target/release/udpserver target/release/sockshttpclient target/release/socksudpclient ../bin/
 
 # Build docker images to run integration tests.
 .PHONY: test-container-image
@@ -179,56 +127,22 @@ run-container-test-prebuilt:
 run-container-test-basic: test-container-image-basic
 	docker run --rm $(TEST_CONTAINER_IMAGE)
 
-# Run a single test script of the basic suite (test_tcp.sh, test_udp.sh or
-# test_mix_udp_associate.sh) in an already built image, so that the scripts of
-# test.sh can run as parallel CI jobs. The helper servers that test.sh starts
-# are started here with the same timings.
-# Example: make test-container-image-basic && make run-container-test-script TEST_SCRIPT=test_tcp.sh
-.PHONY: run-container-test-script
-run-container-test-script:
-	set -e
-	if [ -z "$(TEST_SCRIPT)" ]; then
-		echo "usage: make run-container-test-script TEST_SCRIPT=<test script>"
-		exit 1
-	fi
-	docker run --rm --entrypoint=/bin/bash $(TEST_CONTAINER_IMAGE) -c './httpserver & sleep 2; ./udpserver -port=9090 & sleep 1; exec ./$(TEST_SCRIPT)'
+# Compatibility aliases for the earlier Rust helper target names.
+.PHONY: rust-build rust-test rust-fmt-check rust-clippy rust-fuzz rust-fuzz-list
+rust-build: build
+rust-test: test
+rust-fmt-check: fmt-check
+rust-clippy: clippy
+rust-fuzz: fuzz
+rust-fuzz-list: fuzz-list
 
-# Generate source code from protobuf.
-# Call this after proto files are changed.
-PROTOC_ARCH =
-ifeq ($(shell uname -m), x86_64)
-PROTOC_ARCH = amd64
-endif
-ifeq ($(shell uname -m), arm64)
-PROTOC_ARCH = arm64
-endif
-.PHONY: protobuf
-protobuf:
-	# Download location: https://github.com/protocolbuffers/protobuf/releases
-	if [ ! -x "${ROOT}/tools/build/protoc" ]; then
-		curl -o "${ROOT}/tools/build/protoc" https://raw.githubusercontent.com/enfein/buildtools/main/protoc/33.5/linux_${PROTOC_ARCH}/bin/protoc
-		chmod 755 "${ROOT}/tools/build/protoc"
-	fi
-	# Download location: https://github.com/protocolbuffers/protobuf-go/releases
-	if [ ! -x "${ROOT}/tools/build/protoc-gen-go" ]; then
-		curl -o "${ROOT}/tools/build/protoc-gen-go" https://raw.githubusercontent.com/enfein/buildtools/main/protoc-gen-go/1.36.11/linux_${PROTOC_ARCH}/protoc-gen-go
-		chmod 755 "${ROOT}/tools/build/protoc-gen-go"
-	fi
-
-	PATH=${PATH}:"${ROOT}/tools/build" ${ROOT}/tools/build/protoc -I="${ROOT}/pkg" \
-		--go_out="${ROOT}/pkg/appctl" --go_opt=module="github.com/Acheirial/shadowlemon/v3/pkg/appctl" \
-		--proto_path="${ROOT}/pkg" \
-		"${ROOT}/pkg/appctl/proto/base.proto" \
-		"${ROOT}/pkg/appctl/proto/clientcfg.proto" \
-		"${ROOT}/pkg/appctl/proto/servercfg.proto"
-
-# Clean all the files outside the git repository.
+# Remove build outputs.
 .PHONY: clean
 clean:
-	git clean -fxd
+	rm -rf bin rust/target rust/fuzz/target
+	rm -f coverage.out coverage.html
 
-# Clean go build cache.
+# Clean the Cargo build cache.
 .PHONY: clean-cache
 clean-cache:
-	go clean -cache
-	go clean -testcache
+	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && cargo clean

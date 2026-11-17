@@ -1,5 +1,7 @@
 # 运营维护与故障排查
 
+> **本版本线协议版本为 4；两端必须使用同一版本，否则会话会在握手阶段失败。**
+
 本指南涵盖 shadowlemon 的两个角色——服务器 `shadowlemon server` 与客户端 `shadowlemon client`——的日常运维：查看运行状态、查看日志、排查常见故障，以及说明配置文件的存放位置、可用环境变量和修改设置后的生效方式。
 
 - [查看运行状态](#查看运行状态)
@@ -112,11 +114,11 @@ shadowlemon client start
 
 ## 密码套件协商
 
-客户端与服务端在握手时协商密码套件。可选套件为 `CIPHER_SUITE_XCHACHA20_POLY1305`、`CIPHER_SUITE_AES_256_GCM` 和 `CIPHER_SUITE_AES_128_GCM`，配置字段的含义与协商规则见[密码套件](./protocol.md#密码套件)与[版本与套件协商](./protocol.md#版本与套件协商)。日常运维需要注意下面几点。
+客户端与服务端在握手时协商密码套件。可选套件为 `CIPHER_SUITE_XCHACHA20_POLY1305`、`CIPHER_SUITE_AES_256_GCM` 和 `CIPHER_SUITE_AES_128_GCM`，配置字段的含义与协商规则见[密码套件](../rust/docs/protocol-v0.2.md#2-密码套件与密钥)与[版本与套件协商](../rust/docs/protocol-v0.2.md#34-版本与套件协商)。日常运维需要注意下面几点。
 
-1. **协议版本与兼容性。** 客户端与服务端使用协议版本 3 完成握手，并且**不提供任何向后兼容**：唯一支持的协议版本是 3，协议版本 1、2 的旧对等端发出的首包版本字节不是 3，会被服务端直接丢弃——服务端不写任何响应字节、直接关闭会话（TCP 关闭连接，UDP 丢弃该数据报并继续监听）。不存在任何协商或降级路径，套件协商发生在握手的内部，因此也无法用来规避这一要求。因此升级**必须两端同步**：只升级一端会让所有会话在握手阶段失败，现象与「完全无法连接」相同。
+1. **协议版本与兼容性。** 客户端与服务端使用协议版本 4 完成握手，并且**不提供任何向后兼容**：唯一支持的协议版本是 4，首包版本字节不是 4 的对等端会被服务端直接丢弃——服务端不写任何响应字节、直接关闭会话（TCP 关闭连接，UDP 丢弃该数据报并继续监听）。不存在任何协商或降级路径，套件协商发生在握手的内部，因此也无法用来规避这一要求。因此两端必须使用同一版本：混用不同版本会让所有会话在握手阶段失败，现象与「完全无法连接」相同。
 2. **查看生效的套件。** 服务端用 `shadowlemon server describe config`，客户端用 `shadowlemon client describe config`，查看输出里的 `cipherSuites` 字段。如果没有该字段或者列表为空，说明仍在使用默认行为：客户端只使用 `CIPHER_SUITE_XCHACHA20_POLY1305`，服务端接受全部套件。实际使用的套件由两端在握手时协商：先取两个列表的交集，再在交集中按服务端偏好顺序选出最终成员；挑选最终套件时**不**按密钥长度过滤，客户端把 `CIPHER_SUITE_AES_128_GCM` 放在首位只会让保护握手请求（信封）的静态密钥长度为 16 字节，交集中两种 32 字节密钥的套件同样可能被选中。只有双方都已认证、但套件交集为空时握手才会失败，此时服务端返回 `status` = 2、关闭会话并记录日志。
-3. **建议优先使用 XChaCha20-Poly1305。** 也就是保持默认，或者把 `CIPHER_SUITE_XCHACHA20_POLY1305` 写在客户端与服务端列表的第一项。它的性能不依赖 CPU 的硬件特性；而在没有 AES 硬件指令的 CPU 上，Go 标准库中 AES-GCM 的软件实现必须使用常数时间的实现，速度会明显下降。
+3. **建议优先使用 XChaCha20-Poly1305。** 也就是保持默认，或者把 `CIPHER_SUITE_XCHACHA20_POLY1305` 写在客户端与服务端列表的第一项。它的性能不依赖 CPU 的硬件特性；而在没有 AES 硬件指令的 CPU 上，AES-GCM 的软件实现必须使用常数时间的实现，速度会明显下降。
 4. **两端 CPU 差异较大、并且都支持 AES-NI 时，可以改用 AES-256-GCM。** 如果服务器与客户端的 CPU 都支持 AES 硬件指令（x86 的 AES-NI、ARM 的 Crypto Extension），可以把两端的 `cipherSuites` 都设置为以 `CIPHER_SUITE_AES_256_GCM` 开头的列表。只有在确认两端都有硬件加速时才建议这样做，其余情况请保留 XChaCha20-Poly1305。
 
 ---
@@ -125,17 +127,19 @@ shadowlemon client start
 
 ### 症状：应用配置时提示 unknown field
 
-错误示例：
+错误示例（V0.2 使用 serde 反序列化 JSON，错误信息由 serde 给出）：
 
 ```text
-common.UnmarshalJSON() failed: proto: (line 2:2): unknown field "profiles"
+unknown field `profiles`, expected one of ...
 ```
 
 ```text
-common.UnmarshalJSON() failed: proto: (line 2:2): unknown field "portBindings"
+unknown field `portBindings`, expected one of ...
 ```
 
 这通常表示配置文件被应用到了错误的角色。如果 `shadowlemon server` 报告 `profiles` 等未知字段，很可能是它正在读取客户端配置；如果 `shadowlemon client` 报告 `portBindings` 或 `users` 等未知字段，很可能是它正在读取服务器配置。
+
+配置由 serde 严格校验枚举名（例如 `CIPHER_SUITE_UNSPECIFIED` 或拼写错误的套件名会直接报错）。JSON 字段名与格式见 `rust/docs/config-v0.2.md`。
 
 请使用匹配的命令：
 
@@ -144,7 +148,7 @@ shadowlemon server apply config <server_config.json>
 shadowlemon client apply config <client_config.json>
 ```
 
-另外，如果配置是从旧版本沿用而来，其中可能含有本版本已删除的字段：客户端配置里的 `httpProxyPort`、`httpProxyListenLAN`、`noCheckUpdate`、`rpcPort` 与 `advancedSettings`，以及服务器配置里 `users` 下的 `quotas`。请先从配置文件中删除这些字段，再重新应用。
+另外，配置中可能含有当前 schema 不支持的字段：客户端配置里的 `httpProxyPort`、`httpProxyListenLAN`、`noCheckUpdate`、`rpcPort` 与 `advancedSettings`，以及服务器配置里 `users` 下的 `quotas`。请先从配置文件中删除这些字段，再重新应用。
 
 ### 症状：完全无法连接
 
@@ -153,8 +157,8 @@ shadowlemon client apply config <client_config.json>
 | 1 | `ping <server_ip>` | 确认基础网络可达性。 |
 | 2 | `shadowlemon server status`（服务器端） | 确认代理服务处于 `RUNNING` 状态。 |
 | 3 | `shadowlemon client status`（客户端） | 确认客户端已启动。 |
-| 4 | `shadowlemon client describe config` 与 `shadowlemon server describe config` | 对比**端口**、**协议**、**用户名**和**密码**，必须完全一致；同时确认两端的 `cipherSuites` 有交集（两端至少要有一个共同的套件，见[密码套件协商](#密码套件协商)），并确认两端程序版本可以互相对话：本版本只使用协议版本 3，任何一端升级后另一端必须同步升级，否则所有会话都会在握手阶段被服务端直接丢弃。 |
-| 5 | `date`（两端均执行） | 确认两端时钟偏差不超过 1 分钟；偏差超过 1 分钟会握手失败。 |
+| 4 | `shadowlemon client describe config` 与 `shadowlemon server describe config` | 对比**端口**、**协议**、**用户名**和**密码**，必须完全一致；同时确认两端的 `cipherSuites` 有交集（两端至少要有一个共同的套件，见[密码套件协商](#密码套件协商)），并确认两端使用同一版本：本版本只使用协议版本 4，混用不同版本时所有会话都会在握手阶段被服务端直接丢弃。 |
+| 5 | `shadowlemon --protocol-info`（两端均执行） | 打印协议标识与版本字节（当前为 `4`）。协议不依赖基于时间的盐，时钟偏差不会导致握手失败，因此无需用 `date` 排查时间同步问题。 |
 | 6 | 在两端启用调试日志并重启 | 在日志中查找 `handshake`、`cipher` 或 `underlay` 相关错误；服务器的解密失败通常表现为无法识别用户或密钥不匹配。 |
 | 7 | 检查服务器防火墙 | 确认配置文件里 `portBindings` 声明的 TCP / UDP 端口对公网开放。 |
 | 8 | `shadowlemon server describe config`（服务器端） | 服务端默认要求首包携带匹配的用户提示，配置项 `advancedSettings` -> `userHintIsMandatory` 的默认值是 `true`；未命中提示的源还会在 10 秒内被负缓存直接拒绝。两端用户名/密码不一致、或者首包没有携带提示/提示与任何已注册用户都不匹配时，首包会被丢弃。只有该字段被显式设置为 `false` 才会关闭这一要求。 |
@@ -191,23 +195,25 @@ shadowlemon client apply config <client_config.json>
 
 ## 配置文件存放位置
 
+V0.2 把配置以 JSON 格式保存，默认文件名为 `client.json` / `server.json`。JSON 字段名与格式见 `rust/docs/config-v0.2.md`。
+
 ### 服务器
 
-| 文件 | 路径 | 格式 |
-|------|------|------|
-| 配置 | `/etc/shadowlemon/server.conf.pb` | Protocol buffer（二进制） |
+| 文件 | 默认路径 | 格式 |
+|------|----------|------|
+| 配置 | `$XDG_CONFIG_HOME/shadowlemon/server.json`，未设置 `XDG_CONFIG_HOME` 时为 `~/.config/shadowlemon/server.json` | JSON |
 
-服务器**不**存储密码明文，仅保存校验码。
+使用 systemd 时通常通过环境变量 `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` 把配置指向 `/etc/shadowlemon/server.json`。服务器**不**存储密码明文，仅保存校验码。
 
 ### 客户端
 
 | 操作系统 | 配置路径 | 示例 |
 |----------|----------|------|
-| Linux | `$HOME/.config/shadowlemon/client.conf.pb` | `/home/enfein/.config/shadowlemon/client.conf.pb` |
-| macOS | `$HOME/Library/Application Support/shadowlemon/client.conf.pb` | `/Users/enfein/Library/Application Support/shadowlemon/client.conf.pb` |
-| Windows | `%USERPROFILE%\AppData\Roaming\shadowlemon\client.conf.pb` | `C:\Users\enfein\AppData\Roaming\shadowlemon\client.conf.pb` |
+| Linux | `$XDG_CONFIG_HOME/shadowlemon/client.json` 或 `~/.config/shadowlemon/client.json` | `/home/enfein/.config/shadowlemon/client.json` |
+| macOS | `$HOME/Library/Application Support/shadowlemon/client.json` | `/Users/enfein/Library/Application Support/shadowlemon/client.json` |
+| Windows | `%AppData%\shadowlemon\client.json` | `C:\Users\enfein\AppData\Roaming\shadowlemon\client.json` |
 
-`apply config`、`replace config`、`describe config`、`import config` 等命令读写的都是上表中的文件。
+`apply config`、`replace config`、`describe config`、`import config` 等命令读写的都是上表中的文件（或被环境变量覆盖后的路径）。OpenWrt 上通常把配置放在 `/etc/shadowlemon_client_config.json` 并通过 `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` 指定。
 
 ---
 
@@ -215,11 +221,12 @@ shadowlemon client apply config <client_config.json>
 
 | 变量 | 用途 |
 |------|------|
-| `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式服务器配置文件。 |
-| `SHADOWLEMON_SERVER_CONFIG_FILE` | 从该路径加载 protobuf 格式服务器配置文件。 |
-| `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式客户端配置文件。 |
-| `SHADOWLEMON_CLIENT_CONFIG_FILE` | 从该路径加载 protobuf 格式客户端配置文件。 |
-| `SHADOWLEMON_LOG_NO_TIMESTAMP` | 非空时，服务器日志不打印时间戳（配合 journald 使用）。 |
+| `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式服务器配置文件。V0.2 的默认路径为 `~/.config/shadowlemon/server.json`（见上文），systemd 单元通常用它指向 `/etc/shadowlemon/server.json`。 |
+| `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式客户端配置文件。OpenWrt 上通常用它指向 `/etc/shadowlemon_client_config.json`。 |
+| `SHADOWLEMON_PROTECT_PATH` | Android 平台上与 `VpnService.protect()` 通信的 Unix domain socket 路径（仅 `android` feature 下使用）。 |
+| `SHADOWLEMON_LOG_NO_TIMESTAMP` | 非空时关闭日志时间戳（配合 journald 等已自带时间戳的日志系统使用）。 |
+
+配置只支持 JSON 格式；从自定义路径加载时使用上表中的 `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` / `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE`。
 
 **示例：使用自定义配置文件在前台运行客户端**
 

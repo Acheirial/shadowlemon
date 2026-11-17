@@ -1,22 +1,42 @@
 # 客户端安装与配置
 
+> **本版本线协议版本为 4；两端必须使用同一版本，否则会话会在握手阶段失败。**
+
 ## 下载 shadowlemon 客户端
 
 shadowlemon 客户端软件支持 Windows，Mac OS 和 Linux 系统。你可以从源码编译，也可以直接使用已经编译好的 `shadowlemon` 可执行文件。
 
 ### 从源码编译
 
-按照[编译](./compile.md)文档准备好编译环境，然后在项目根目录运行：
+按照[编译](./compile.md)文档准备好 Rust 编译环境，然后在 `rust/` 目录运行：
 
 ```sh
-make
+export PATH="$HOME/.cargo/bin:$PATH"
+cd rust
+cargo build --release
 ```
 
-编译结果位于 `bin/` 目录。把 `bin/shadowlemon` 复制到系统路径 `PATH` 即可。
+编译结果为 `rust/target/release/shadowlemon`（显式指定目标三元组时位于 `rust/target/<target>/release/shadowlemon`）。也可以在仓库根目录运行 `make`（或 `make build` / `make rust-build`），它会额外把二进制复制到 `bin/shadowlemon`。把该二进制复制到系统路径 `PATH` 即可。
 
 ### 使用已编译的二进制
 
 如果你已经获得编译好的 `shadowlemon` 可执行文件，解压缩后将其复制到系统路径 `PATH` 中即可。
+
+### 二进制与配置文件位置
+
+可用子命令包括 `shadowlemon client run` / `start` / `stop` / `status` / `apply config <FILE>` / `replace config <FILE>` / `describe config` / `export config [simple]` / `import config <URL>` 等。二进制与配置文件的位置如下：
+
+| 项目 | 路径 |
+| :-- | :-- |
+| 编译产物 | `rust/target/release/shadowlemon`（显式指定目标三元组时位于 `rust/target/<target>/release/shadowlemon`；在仓库根目录运行 `make` 会另存一份为 `bin/shadowlemon`） |
+| 默认客户端配置 | `$XDG_CONFIG_HOME/shadowlemon/client.json`，未设置 `XDG_CONFIG_HOME` 时为 `~/.config/shadowlemon/client.json`（JSON） |
+| 环境变量覆盖 | `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` |
+
+JSON 字段名与格式见 `rust/docs/config-v0.2.md`。如需从自定义路径加载配置（例如 OpenWrt 上的 `/etc/shadowlemon_client_config.json`），使用：
+
+```sh
+SHADOWLEMON_CLIENT_CONFIG_JSON_FILE=/etc/shadowlemon_client_config.json shadowlemon client run
+```
 
 ## 修改客户端的设置
 
@@ -89,7 +109,7 @@ shadowlemon client replace config <FILE>
 6. 【可选】请为 `profiles` -> `mtu` 属性指定一个从 1280 到 1500 之间的值，默认值为 1400。该值是 L3 MTU，即网络路径能够通过的最大 IP 报文长度；UDP 代理协议的有效载荷预算会在此基础上另外扣除 IP 报文头与 UDP 报文头（IPv6 下最多 48 字节）。这个值必须与代理服务器相同；只有两端取值一致，才能避免因分片导致的性能下降。
 7. 【可选】如果想要调整多路复用的频率，是更多地创建新连接，还是更多地重用旧连接，可以为 `profiles` -> `multiplexing` -> `level` 属性设定一个值。这里可以使用的值包括 `MULTIPLEXING_OFF`, `MULTIPLEXING_LOW`, `MULTIPLEXING_MIDDLE`, `MULTIPLEXING_HIGH`。其中 `MULTIPLEXING_OFF` 会关闭多路复用功能。默认值为 `MULTIPLEXING_LOW`。
 8. 【可选】如果想开启 0-RTT 握手，请将 `profiles` -> `handshakeMode` 属性的值设置为 `HANDSHAKE_NO_WAIT`，否则请设置为 `HANDSHAKE_STANDARD`。默认值为 `HANDSHAKE_STANDARD`。
-9. 【可选】`profiles` -> `cipherSuites` 属性是客户端愿意使用的密码套件列表，**第一个元素最优先**。可以使用的值包括 `CIPHER_SUITE_XCHACHA20_POLY1305`，`CIPHER_SUITE_AES_256_GCM` 和 `CIPHER_SUITE_AES_128_GCM`。**未设置或者设置为空列表时，客户端只使用 `CIPHER_SUITE_XCHACHA20_POLY1305`**，与旧版本配置的行为一致。会话最终使用的套件由客户端与服务端在握手时协商决定，规则和适用场景见[密码套件](./protocol.md#密码套件)。列表的第 0 项还决定保护握手请求（信封）的静态密钥的密钥长度，但服务端挑选最终套件时**不**按密钥长度过滤，因此把 `CIPHER_SUITE_AES_128_GCM` 排在首位不会排除另外两种套件（详见[版本与套件协商](./protocol.md#版本与套件协商)）。
+9. 【可选】`profiles` -> `cipherSuites` 属性是客户端愿意使用的密码套件列表，**第一个元素最优先**。可以使用的值包括 `CIPHER_SUITE_XCHACHA20_POLY1305`，`CIPHER_SUITE_AES_256_GCM` 和 `CIPHER_SUITE_AES_128_GCM`。**未设置或者设置为空列表时，客户端只使用 `CIPHER_SUITE_XCHACHA20_POLY1305`**。会话最终使用的套件由客户端与服务端在握手时协商决定，规则和适用场景见[密码套件](../rust/docs/protocol-v0.2.md#2-密码套件与密钥)。列表的第 0 项还决定保护握手请求（信封）的静态密钥的密钥长度，但服务端挑选最终套件时**不**按密钥长度过滤，因此把 `CIPHER_SUITE_AES_128_GCM` 排在首位不会排除另外两种套件（详见[版本与套件协商](../rust/docs/protocol-v0.2.md#34-版本与套件协商)）。
 10. 请为 `socks5Port` 属性指定一个从 1025 到 65535 之间的数值。
 11. 【可选】如果客户端需要为局域网中的其他设备提供代理服务，请将 `socks5ListenLAN` 属性设置为 `true`。
 
@@ -102,7 +122,7 @@ shadowlemon client replace config <FILE>
 - `multiplexing` -> `level` 只接受 `MULTIPLEXING_OFF`、`MULTIPLEXING_LOW`、`MULTIPLEXING_MIDDLE`、`MULTIPLEXING_HIGH` 等合法的枚举值，非法取值会报错。
 - `profiles` -> `cipherSuites` 只接受 `CIPHER_SUITE_XCHACHA20_POLY1305`、`CIPHER_SUITE_AES_256_GCM`、`CIPHER_SUITE_AES_128_GCM` 等合法的枚举值，不能包含 `CIPHER_SUITE_UNSPECIFIED`，非法取值或拼写错误会报错；列表中的重复项会被忽略，只保留第一次出现的那个，因此相对偏好顺序保持不变。
 
-> **注意**：本版本已移除 HTTP / HTTPS 代理功能、客户端自动更新检查功能与本地控制接口，配置中不再支持 `httpProxyPort`、`httpProxyListenLAN`、`noCheckUpdate`、`rpcPort` 和客户端 `advancedSettings` 字段。如果你从旧版本升级，请先从配置文件中删除这些字段，否则 `shadowlemon client apply config`、`shadowlemon client import config` 或 `shadowlemon client run` 会报未知字段（unknown field）错误。
+> **注意**：本版本已移除 HTTP / HTTPS 代理功能、客户端自动更新检查功能与本地控制接口，配置中不再支持 `httpProxyPort`、`httpProxyListenLAN`、`noCheckUpdate`、`rpcPort` 和客户端 `advancedSettings` 字段。如果配置文件中含有这些字段，请先将其删除，否则 `shadowlemon client apply config`、`shadowlemon client import config` 或 `shadowlemon client run` 会报未知字段（unknown field）错误。
 
 如果你安装了多台代理服务器，或者一台服务器监听多个端口，可以把它们都添加到客户端设置中。每次发起新的连接时，客户端会随机选取其中的一台服务器和一个端口。**如果使用了多台服务器，请确保每一台服务器都启动了 `shadowlemon server`。**
 
@@ -255,11 +275,11 @@ Chrome / Firefox 等浏览器可以通过安装插件，使用 socks5 代理访�
 
 请连同该 profile 的其它必要字段一起填写：应用配置补丁时，补丁中出现的 profile 会整体替换同名的已有 profile，因此只写 `profileName` 和 `cipherSuites` 会丢失原来的 `user`、`servers` 等设置。也可以直接修改[上文](#修改客户端的设置)的完整配置示例，再使用 `shadowlemon client replace config <FILE>` 写入。
 
-可以使用的值包括 `CIPHER_SUITE_XCHACHA20_POLY1305`，`CIPHER_SUITE_AES_256_GCM` 和 `CIPHER_SUITE_AES_128_GCM`。未设置 `cipherSuites` 或者设置为空列表时，客户端只使用 `CIPHER_SUITE_XCHACHA20_POLY1305`，因此不含有该字段的旧版本配置文件可以继续使用，行为保持不变。
+可以使用的值包括 `CIPHER_SUITE_XCHACHA20_POLY1305`，`CIPHER_SUITE_AES_256_GCM` 和 `CIPHER_SUITE_AES_128_GCM`。未设置 `cipherSuites` 或者设置为空列表时，客户端只使用 `CIPHER_SUITE_XCHACHA20_POLY1305`。
 
 会话实际使用的套件由两端在握手时协商：先取「客户端列表」与「服务端允许集合」的交集，再在交集中按**服务端偏好顺序**选出最终成员，因此最终套件可能不是客户端列表的第一项。挑选最终套件时**不**按密钥长度过滤：把 `CIPHER_SUITE_AES_128_GCM`（16 字节密钥）排在首位，只决定保护握手请求（信封）的静态密钥长度为 16 字节，`CIPHER_SUITE_XCHACHA20_POLY1305` 与 `CIPHER_SUITE_AES_256_GCM`（都是 32 字节密钥）同样可以被服务端选中；只要客户端的列表与服务端的允许集合有交集，双方就能正常建立会话。反之，如果交集为空，握手就会失败，服务端返回 `status` = 2、关闭会话并记录日志。无论如何，两端至少要有一个共同的套件。
 
-一般建议保留默认的 `CIPHER_SUITE_XCHACHA20_POLY1305`：它的性能不依赖 CPU 的硬件特性。`CIPHER_SUITE_AES_256_GCM` 与 `CIPHER_SUITE_AES_128_GCM` 只有在 CPU 支持 AES 硬件指令时才有优势，详见[密码套件](./protocol.md#密码套件)；运维和排查注意事项见[密码套件协商](./operation.md#密码套件协商)。
+一般建议保留默认的 `CIPHER_SUITE_XCHACHA20_POLY1305`：它的性能不依赖 CPU 的硬件特性。`CIPHER_SUITE_AES_256_GCM` 与 `CIPHER_SUITE_AES_128_GCM` 只有在 CPU 支持 AES 硬件指令时才有优势，详见[密码套件](../rust/docs/protocol-v0.2.md#2-密码套件与密钥)；运维和排查注意事项见[密码套件协商](./operation.md#密码套件协商)。
 
 ## 分享客户端的设置
 
@@ -302,7 +322,7 @@ shadowlemons://user1:password1@1.2.3.4?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400
 - `port`
 - `protocol`
 
-其中 `profile` 必须出现一次，`mtu`，`multiplexing`，`handshake-mode`，`cipher-suites` 以及 `traffic-pattern` 最多出现一次，`port` 和 `protocol` 可以出现多次，且他们出现的次数必须相同，以便将同一位置上的 `port` 和 `protocol` 联系起来。另外 `port` 也可以用来指定一段连续的端口。`traffic-pattern` 的值使用 base64 编码的 protobuf 格式，与[流量模式](./traffic-pattern.md)文档中描述的字段一一对应。
+其中 `profile` 必须出现一次，`mtu`，`multiplexing`，`handshake-mode`，`cipher-suites` 以及 `traffic-pattern` 最多出现一次，`port` 和 `protocol` 可以出现多次，且他们出现的次数必须相同，以便将同一位置上的 `port` 和 `protocol` 联系起来。另外 `port` 也可以用来指定一段连续的端口。`traffic-pattern` 的值使用 base64 编码的确定性二进制配置格式，与[流量模式](./traffic-pattern.md)文档中描述的字段一一对应。
 
 `cipher-suites` 的值是用逗号分隔的套件枚举名列表，顺序即客户端的偏好顺序，例如 `cipher-suites=CIPHER_SUITE_XCHACHA20_POLY1305,CIPHER_SUITE_AES_256_GCM`。如果 profile 设置了 `cipherSuites`，`shadowlemon client export config simple` 生成的链接中就会包含该参数；链接中省略该参数等同于未设置 `cipherSuites`，即客户端只使用 `CIPHER_SUITE_XCHACHA20_POLY1305`。如果列表中含有无法识别的套件名，或者其中含有 `CIPHER_SUITE_UNSPECIFIED`，`shadowlemon client import config <URL>` 会报错。
 

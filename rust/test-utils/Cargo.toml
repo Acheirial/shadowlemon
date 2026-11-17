@@ -1,0 +1,33 @@
+[package]
+name = "shadowlemon-test-utils"
+description = "Helper servers and clients for the ShadowLemon integration suite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+rand.workspace = true
+sha1.workspace = true
+tokio.workspace = true
+
+[[bin]]
+name = "httpserver"
+path = "src/bin/httpserver.rs"
+
+[[bin]]
+name = "udpserver"
+path = "src/bin/udpserver.rs"
+
+[[bin]]
+name = "sockshttpclient"
+path = "src/bin/sockshttpclient.rs"
+
+[[bin]]
+name = "socksudpclient"
+path = "src/bin/socksudpclient.rs"
+
+[lints]
+workspace = true

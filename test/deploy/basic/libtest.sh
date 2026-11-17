@@ -15,6 +15,15 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+# Every shadowlemon invocation below uses TEST_BINARY, which defaults to the
+# Rust binary copied into /test as ./shadowlemon.
+TEST_BINARY=${TEST_BINARY:-./shadowlemon}
+
+# The Rust daemon redirects stdout/stderr to /dev/null. Scenarios that inspect
+# the negotiated cipher suite therefore run the client in the foreground and
+# capture its tracing output here.
+CLIENT_LOG_DIR="$HOME/.cache/shadowlemon"
+
 function print_client_log() {
     echo "========== BEGIN OF CLIENT LOG =========="
     cat $HOME/.cache/shadowlemon/*.log
@@ -46,17 +55,17 @@ function run_or_fail() {
 function apply_server_config() {
     local config=$1
 
-    run_or_fail "shadowlemon server apply config $config" ./shadowlemon server apply config "$config"
+    run_or_fail "shadowlemon server apply config $config" "$TEST_BINARY" server apply config "$config"
     echo "server config:"
-    ./shadowlemon server describe config
+    "$TEST_BINARY" server describe config
 }
 
 # start_server
 function start_server() {
     local server_status
 
-    run_or_fail "shadowlemon server start" ./shadowlemon server start
-    server_status=$(./shadowlemon server status)
+    run_or_fail "shadowlemon server start" "$TEST_BINARY" server start
+    server_status=$("$TEST_BINARY" server status)
     echo "server status:"
     echo "$server_status"
     if [[ "$server_status" != *RUNNING* ]]; then
@@ -69,9 +78,9 @@ function start_server() {
 function stop_server() {
     local server_status
 
-    run_or_fail "shadowlemon server stop" ./shadowlemon server stop
+    run_or_fail "shadowlemon server stop" "$TEST_BINARY" server stop
     sleep 1
-    server_status=$(./shadowlemon server status)
+    server_status=$("$TEST_BINARY" server status)
     echo "server status:"
     echo "$server_status"
     if [[ "$server_status" != *STOPPED* ]]; then
@@ -84,21 +93,25 @@ function stop_server() {
 function apply_client_config() {
     local config=$1
 
-    run_or_fail "shadowlemon client apply config $config" ./shadowlemon client apply config "$config"
+    run_or_fail "shadowlemon client apply config $config" "$TEST_BINARY" client apply config "$config"
     echo "client config:"
-    ./shadowlemon client describe config
+    "$TEST_BINARY" client describe config
 }
 
 # start_client
 function start_client() {
     local client_status
 
-    run_or_fail "shadowlemon client start" ./shadowlemon client start
-    client_status=$(./shadowlemon client status)
+    # Run in the foreground so the client log is available to the assertions.
+    mkdir -p "$CLIENT_LOG_DIR"
+    "$TEST_BINARY" client run > "$CLIENT_LOG_DIR/client.log" 2>&1 &
+    sleep 1
+    client_status=$("$TEST_BINARY" client status 2>&1)
     echo "client status:"
     echo "$client_status"
     if [[ "$client_status" != *RUNNING* ]]; then
         echo "client is not running"
+        print_client_log
         exit 1
     fi
 }
@@ -107,9 +120,9 @@ function start_client() {
 function stop_client() {
     local client_status
 
-    run_or_fail "shadowlemon client stop" ./shadowlemon client stop
+    run_or_fail "shadowlemon client stop" "$TEST_BINARY" client stop
     sleep 1
-    client_status=$(./shadowlemon client status)
+    client_status=$("$TEST_BINARY" client status)
     echo "client status:"
     echo "$client_status"
     if [[ "$client_status" != *STOPPED* ]]; then

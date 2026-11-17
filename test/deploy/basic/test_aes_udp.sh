@@ -34,26 +34,23 @@ source ./libtest.sh
 # transport (a PacketUnderlay), so a successful run proves the AES-256-GCM suite
 # end to end over UDP rather than over TCP as test_aes.sh does.
 #
-# The negotiated suite is only observable in a log line, and that line is
-# written at DEBUG level by the client (pkg/protocol/session.go, message
-# "<session> handshake completed with protocol ShadowLemon V0.1 and cipher suite <suite>").
+# The negotiated suite is observable in the client log: when a session is
+# attached to an underlay the Rust driver logs at DEBUG level
+# "TCP session established to StreamUnderlay{" or
+# "UDP session established to PacketUnderlay{", with a `suite=<name>` field on
+# the same line (rust/crates/shadowlemon-protocol/src/driver.rs). The underlay
+# name tells the transport apart: PacketUnderlay is UDP, StreamUnderlay is TCP.
 # client_aes_udp.json therefore sets "loggingLevel": "DEBUG"; with the "INFO"
-# level used by client_udp.json the line is never emitted. The client writes its
-# log to $HOME/.cache/shadowlemon/<timestamp>_<pid>.log
-# (pkg/log/client_logging.go, log.NewClientLogFile()).
+# level used by client_udp.json the line is never emitted. start_client in
+# libtest.sh runs the client in the foreground and captures its log in
+# $HOME/.cache/shadowlemon/client.log.
 #
-# NOTE: only the client logs the negotiated suite. The server side
-# (Session.acceptHandshake) logs nothing when the handshake succeeds; it only
-# logs the reasons of a rejection, also at DEBUG level.
-CLIENT_LOG_DIR="$HOME/.cache/shadowlemon"
-EXPECTED_AES_LINE="handshake completed with protocol ShadowLemon V0.1 and cipher suite AES_256_GCM"
-HANDSHAKE_LINE="handshake completed with protocol ShadowLemon V0.1 and cipher suite"
-# The client logs "Adding session <id> to <underlay>" at DEBUG level when a
-# session is attached to an underlay (pkg/protocol/underlay_packet.go and
-# pkg/protocol/underlay_stream.go). The underlay name tells the transport apart:
-# PacketUnderlay is the UDP transport and StreamUnderlay is the TCP transport.
+# NOTE: only the client logs the negotiated suite. The server logs the reasons
+# of a rejection, but nothing when a handshake succeeds.
+AES_SUITE="AES_256_GCM"
 PACKET_UNDERLAY_LINE="to PacketUnderlay{"
 STREAM_UNDERLAY_LINE="to StreamUnderlay{"
+SESSION_ESTABLISHED_LINE="session established to"
 
 # count_client_log_matches <substring>
 # Prints how many lines of the client log contain the given substring.
@@ -64,6 +61,17 @@ function count_client_log_matches() {
     # "grep | wc -l" keeps this non-fatal when the log file is missing or no
     # line matches, so that "set -e" doesn't abort with an empty diagnostic.
     count=$(grep -h -F "$pattern" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | wc -l)
+    echo "$((count))"
+}
+
+# count_aes_sessions <underlay marker>
+# Number of established sessions on the given transport whose log line also
+# carries the AES_256_GCM suite field.
+function count_aes_sessions() {
+    local marker=$1
+    local count
+
+    count=$(grep -h -F "$marker" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | grep -F -c "$AES_SUITE" || true)
     echo "$((count))"
 }
 
@@ -83,58 +91,48 @@ function print_client_log_tail() {
 # to CIPHER_SUITE_XCHACHA20_POLY1305 would still carry traffic, and a session
 # that ran over the TCP transport would still transfer the same payloads.
 function assert_aes_cipher_suite_over_udp() {
-    local aes_count
-    local handshake_count
-    local packet_count
-    local stream_count
+    local session_count
+    local aes_packet_count
+    local aes_stream_count
 
-    aes_count=$(count_client_log_matches "$EXPECTED_AES_LINE")
-    handshake_count=$(count_client_log_matches "$HANDSHAKE_LINE")
-    packet_count=$(count_client_log_matches "$PACKET_UNDERLAY_LINE")
-    stream_count=$(count_client_log_matches "$STREAM_UNDERLAY_LINE")
+    session_count=$(count_client_log_matches "$SESSION_ESTABLISHED_LINE")
+    aes_packet_count=$(count_aes_sessions "$PACKET_UNDERLAY_LINE")
+    aes_stream_count=$(count_aes_sessions "$STREAM_UNDERLAY_LINE")
 
-    echo "cipher suite assertion: $handshake_count session(s) completed the ShadowLemon V0.1 handshake,"
-    echo "cipher suite assertion: $aes_count of them used AES_256_GCM."
-    echo "transport assertion: $packet_count session(s) were attached to the UDP transport and"
-    echo "transport assertion: $stream_count session(s) to the TCP transport."
+    echo "session assertion: $session_count session(s) were established."
+    echo "transport assertion: $aes_packet_count AES session(s) used UDP (PacketUnderlay) and"
+    echo "transport assertion: $aes_stream_count AES session(s) used TCP (StreamUnderlay)."
 
-    if [[ "$handshake_count" -eq 0 ]]; then
-        echo "cipher suite assertion FAILED: no client log line reports a completed ShadowLemon V0.1 handshake at all,"
+    if [[ "$session_count" -eq 0 ]]; then
+        echo "session assertion FAILED: no client log line reports an established session at all,"
         echo "so the session either wasn't established or the client didn't log at DEBUG level."
-        echo "the expected log line is written by pkg/protocol/session.go:"
-        echo "  handshake completed with protocol ShadowLemon V0.1 and cipher suite <suite>"
+        echo "the expected log lines are written by rust/crates/shadowlemon-protocol/src/driver.rs:"
+        echo "  UDP session established to PacketUnderlay{ ... suite=<name> ..."
         print_client_log_tail 80
         print_client_log
         exit 1
     fi
 
-    if [[ "$aes_count" -eq 0 ]]; then
-        echo "cipher suite assertion FAILED: none of the $handshake_count completed session(s) used AES_256_GCM."
-        echo "observed completed handshakes (the suite name is at the end of each line):"
-        grep -h -F "$HANDSHAKE_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | head -n 3 || true
+    if [[ "$aes_packet_count" -eq 0 ]]; then
+        echo "cipher suite assertion FAILED: none of the $session_count established session(s) used"
+        echo "AES_256_GCM over the UDP transport."
+        echo "observed established sessions:"
+        grep -h -F "$SESSION_ESTABLISHED_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | head -n 3 || true
         echo "a XCHACHA20_POLY1305 suite above means the client fell back to the fallback suite"
         echo "instead of using the AES-256-GCM suite both configurations ask for."
         echo "help: check that server_aes_udp.json sets cipherSuites to CIPHER_SUITE_AES_256_GCM,"
         echo "help: that client_aes_udp.json sets profiles[0].cipherSuites and \"loggingLevel\": \"DEBUG\","
-        echo "help: and that the log doesn't contain 'no common cipher suite with the server, the client offered'."
+        echo "help: and that the log doesn't contain 'no common cipher suite with the server'."
         print_client_log_tail 80
         print_client_log
         exit 1
     fi
 
-    if [[ "$packet_count" -eq 0 ]]; then
-        echo "transport assertion FAILED: no session ran over the UDP transport, so this test didn't"
-        echo "verify AES-256-GCM over UDP. client_aes_udp.json must list only UDP port bindings,"
-        echo "and server_aes_udp.json must bind the same UDP ports."
-        print_client_log_tail 80
-        print_client_log
-        exit 1
+    echo "cipher suite assertion passed: $aes_packet_count AES session(s) used the UDP transport."
+    if [[ "$aes_stream_count" -gt 0 ]]; then
+        echo "note: $aes_stream_count AES session(s) also used the TCP transport."
     fi
-
-    echo "cipher suite assertion passed: $aes_count session(s) negotiated AES_256_GCM."
-    echo "transport assertion passed: $packet_count session(s) used the UDP transport."
-    grep -h -F "$EXPECTED_AES_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | head -n 3 || true
-    grep -h -F "$PACKET_UNDERLAY_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | head -n 3 || true
+    grep -h -F "$PACKET_UNDERLAY_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | grep -F "$AES_SUITE" | head -n 3 || true
 }
 
 # Update server with the mixed config that only allows AES-256-GCM.

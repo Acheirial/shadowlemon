@@ -1,0 +1,191 @@
+name: Rust CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'rust/**'
+      - 'test/**'
+      - 'Makefile'
+      - '.dockerignore'
+      - '.github/workflows/rust-ci.yaml'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - 'test/**'
+      - 'Makefile'
+      - '.dockerignore'
+      - '.github/workflows/rust-ci.yaml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: rustfmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> rust/target
+      - name: Check formatting
+        working-directory: rust
+        run: cargo fmt --all -- --check
+      - name: Clippy (all targets and features)
+        working-directory: rust
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> rust/target
+      - name: Workspace tests
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd rust
+          cargo test --workspace
+
+  build:
+    name: release + embedded builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> rust/target
+      - name: Release build
+        working-directory: rust
+        run: cargo build --workspace --release
+      - name: Embedded profile build
+        working-directory: rust
+        run: cargo build --profile embedded --features embedded
+
+  cross:
+    name: cross ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # MIPS is a tier-3 target: it has no prebuilt std and needs nightly
+    # -Z build-std plus a matching toolchain, so it is best-effort only.
+    continue-on-error: ${{ matrix.mode == 'build-std' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            mode: cross
+            profile: release
+            feature: embedded
+          - target: aarch64-unknown-linux-musl
+            mode: cross
+            profile: embedded
+            feature: embedded
+          - target: x86_64-pc-windows-gnu
+            mode: cross
+            profile: release
+            feature: windows
+          - target: aarch64-linux-android
+            mode: check
+            profile: release
+            feature: android
+          - target: aarch64-apple-darwin
+            mode: check
+            profile: release
+            feature: ''
+          - target: mipsel-unknown-linux-musl
+            mode: build-std
+            profile: embedded
+            feature: embedded
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install target std library
+        if: matrix.mode == 'cross' || matrix.mode == 'check'
+        run: rustup target add "${{ matrix.target }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> rust/target
+          key: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.mode == 'cross'
+        run: cargo install cross --locked
+      - name: Cross-link binary
+        if: matrix.mode == 'cross'
+        working-directory: rust
+        env:
+          TARGET: ${{ matrix.target }}
+          PROFILE: ${{ matrix.profile }}
+          FEATURE: ${{ matrix.feature }}
+        run: |
+          set -euo pipefail
+          if [ -n "$FEATURE" ]; then
+            cross build -p shadowlemon --target "$TARGET" --profile "$PROFILE" --features "$FEATURE"
+          else
+            cross build -p shadowlemon --target "$TARGET" --profile "$PROFILE"
+          fi
+      - name: Type-check target
+        if: matrix.mode == 'check'
+        working-directory: rust
+        env:
+          TARGET: ${{ matrix.target }}
+          FEATURE: ${{ matrix.feature }}
+        run: |
+          set -euo pipefail
+          if [ -n "$FEATURE" ]; then
+            cargo check -p shadowlemon --target "$TARGET" --features "$FEATURE"
+          else
+            cargo check -p shadowlemon --target "$TARGET"
+          fi
+      - name: Install nightly with rust-src (tier-3 target)
+        if: matrix.mode == 'build-std'
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - name: Type-check tier-3 target with build-std
+        if: matrix.mode == 'build-std'
+        working-directory: rust
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo +nightly check -Z build-std=core,alloc,std -p shadowlemon --target "$TARGET"
+
+  integration:
+    name: integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TEST_CONTAINER_IMAGE: shadowlemon_basic:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> rust/target
+          key: integration
+      - name: Build main and helper binaries
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          make test-binary
+      - name: Build integration test image
+        run: make test-container-image TEST_BINARY_PREREQ=
+      - name: Run test/deploy/basic/test.sh in the image
+        run: make run-container-test TEST_BINARY_PREREQ=

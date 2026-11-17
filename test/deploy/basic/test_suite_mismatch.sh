@@ -33,25 +33,24 @@ source ./libtest.sh
 # a reverse assertion:
 #
 #   1. the socks5 client must fail instead of transferring data,
-#   2. the client log must explain the failure with the "no common cipher suite
-#      with the server, the client offered ..." message of pkg/protocol/session.go
-#      and must NOT report a completed handshake,
+#   2. the client log must explain the failure with the Rust driver's warning
+#      "no common cipher suite with the server" and must NOT report an
+#      established session,
 #   3. both the server and the client must still be RUNNING: a peer that offers a suite the
 #      server doesn't allow is rejected per session, and must not take the
 #      daemons down or leave a half established session behind.
 #
-# The reason of the rejection is only written to the client log at DEBUG level
-# (pkg/protocol/mux.go logs the error of the underlay event loop), so
-# client_suite_mismatch.json sets "loggingLevel": "DEBUG". The client writes its
-# log to $HOME/.cache/shadowlemon/<timestamp>_<pid>.log
-# (pkg/log/client_logging.go, log.NewClientLogFile()).
-CLIENT_LOG_DIR="$HOME/.cache/shadowlemon"
-NO_COMMON_SUITE_LINE="no common cipher suite with the server, the client offered"
-HANDSHAKE_LINE="handshake completed with protocol ShadowLemon V0.1 and cipher suite"
+# The reason of the rejection is written to the client log at WARN level by
+# rust/crates/shadowlemon-protocol/src/driver.rs. The successful-session log
+# lines are at DEBUG level, so client_suite_mismatch.json sets
+# "loggingLevel": "DEBUG". start_client in libtest.sh runs the client in the
+# foreground and captures its log in $HOME/.cache/shadowlemon/client.log.
+NO_COMMON_SUITE_LINE="no common cipher suite with the server"
+HANDSHAKE_LINE="session established to"
 # A mismatch must be rejected per session, right after the client sent its
-# handshake request: an attempt that waits for the client handshake timeout
-# means the client never saw the diagnostic response of the server.
-HANDSHAKE_TIMEOUT_LINE="handshake timed out after"
+# handshake request: an attempt that waits for the handshake timeout means the
+# client never saw the diagnostic response of the server.
+HANDSHAKE_TIMEOUT_LINE="handshake timed out"
 
 # count_client_log_matches <substring>
 # Prints how many lines of the client log contain the given substring.
@@ -75,8 +74,8 @@ function print_client_log_tail() {
 }
 
 # wait_for_client_log_match <substring> <max number of seconds to wait>
-# The failed handshake is reported by a background goroutine, which may write
-# the log line slightly after the socks5 client observed the failure. This waits
+# The failed handshake is reported by the client runtime, which may write the
+# log line slightly after the socks5 client observed the failure. This waits
 # for the line with a bounded number of retries, and returns 1 when the line
 # never appears.
 function wait_for_client_log_match() {
@@ -99,8 +98,8 @@ function assert_daemon_running() {
     local desc=$2
     local status
 
-    if ! status=$(./shadowlemon "$cmd" status 2>&1); then
-        status="./shadowlemon $cmd status failed: $status"
+    if ! status=$("$TEST_BINARY" "$cmd" status 2>&1); then
+        status="$TEST_BINARY $cmd status failed: $status"
     fi
     echo "$desc status:"
     echo "$status"
@@ -157,9 +156,8 @@ echo "the socks5 client never transferred data (exit code $probe_exit_code), as 
 # The failed handshake must be explained in the client log.
 if ! wait_for_client_log_match "$NO_COMMON_SUITE_LINE" 10; then
     echo "the client log does not explain why the handshake failed."
-    echo "the expected log line is written by pkg/protocol/session.go:"
-    echo "  fmt.Errorf(\"no common cipher suite with the server, the client offered %v\", suites)"
-    echo "and reported by pkg/protocol/mux.go at DEBUG level."
+    echo "the expected log line is written by rust/crates/shadowlemon-protocol/src/driver.rs:"
+    echo "  warn!(\"no common cipher suite with the server\")"
     echo "help: check that client_suite_mismatch.json sets \"loggingLevel\": \"DEBUG\","
     echo "help: and that the server allows CIPHER_SUITE_AES_128_GCM while the client offers"
     echo "help: CIPHER_SUITE_XCHACHA20_POLY1305, so discovery succeeds but negotiation doesn't."
@@ -175,14 +173,14 @@ grep -h -F "$NO_COMMON_SUITE_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | head -n
 # No session may have been established.
 handshake_count=$(count_client_log_matches "$HANDSHAKE_LINE")
 if [[ "$handshake_count" -ne 0 ]]; then
-    echo "cipher suite assertion FAILED: $handshake_count session(s) completed the ShadowLemon V0.1 handshake"
+    echo "cipher suite assertion FAILED: $handshake_count session(s) were established"
     echo "although the server and the client don't share a cipher suite:"
     grep -h -F "$HANDSHAKE_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | head -n 3 || true
     print_client_log_tail 80
     print_client_log
     exit 1
 fi
-echo "cipher suite assertion passed: no session completed the handshake."
+echo "cipher suite assertion passed: no session was established."
 
 # Every attempt has to fail right after the handshake request, because the
 # server answers each one with a diagnostic response. An attempt that waits for

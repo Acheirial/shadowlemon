@@ -1,0 +1,61 @@
+[package]
+name = "shadowlemon-app"
+description = "Client and server application wiring for ShadowLemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Enables the simplified V0.2 low-entropy encoding end to end. The example
+# configurations select a low-entropy mode, so desktop/server builds need this
+# feature to accept them; the embedded build intentionally leaves it off.
+low-entropy = [
+    "shadowlemon-config/low-entropy",
+    "shadowlemon-wire/low-entropy",
+]
+# Drops egress and DNS resolution, low-entropy nonce support and verbose
+# logging. These switches are forwarded to every layer that implements them.
+embedded = [
+    "shadowlemon-config/embedded",
+    "shadowlemon-protocol/embedded",
+    "shadowlemon-socks5/embedded",
+    "shadowlemon-wire/embedded",
+]
+android = [
+    "shadowlemon-config/android",
+    "shadowlemon-protocol/android",
+    "shadowlemon-socks5/android",
+    "shadowlemon-wire/android",
+]
+windows = [
+    "shadowlemon-config/windows",
+    "shadowlemon-protocol/windows",
+    "shadowlemon-socks5/windows",
+    "shadowlemon-wire/windows",
+]
+
+[dependencies]
+clap.workspace = true
+dashmap.workspace = true
+libc = "0.2"
+futures.workspace = true
+shadowlemon-config.workspace = true
+shadowlemon-crypto.workspace = true
+shadowlemon-protocol.workspace = true
+shadowlemon-socks5.workspace = true
+shadowlemon-wire.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

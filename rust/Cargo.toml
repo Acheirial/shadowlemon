@@ -1,0 +1,102 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shadowlemon-crypto",
+    "crates/shadowlemon-wire",
+    "crates/shadowlemon-protocol",
+    "crates/shadowlemon-socks5",
+    "crates/shadowlemon-config",
+    "crates/shadowlemon-app",
+    "crates/shadowlemon",
+    "test-utils",
+]
+# cargo-fuzz requires nightly and its own target dir; keep it outside the main
+# workspace so stable `cargo test`/`cargo clippy --all-targets` stay clean.
+exclude = ["fuzz"]
+
+# Placeholder crates intentionally declare the dependencies their future
+# owners will use; do not warn about unused manifest entries while those
+# modules are being written.
+[workspace.lints.cargo]
+unused_dependencies = "allow"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Acheirial/shadowlemon"
+
+# All third party versions live here so that every crate uses exactly the same
+# dependency graph. The `embedded` / `android` / `windows` features are
+# declared by each crate and forwarded by the binary; Cargo unifies them.
+[workspace.dependencies]
+# crypto
+aead = { version = "0.6", features = ["alloc"] }
+aes-gcm = "0.11"
+chacha20poly1305 = "0.11"
+getrandom = "0.4"
+hkdf = "0.13"
+hmac = "0.13"
+pbkdf2 = "0.13"
+sha2 = "0.11"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.10"
+
+# runtime / wire
+tokio = { version = "1", features = [
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "io-util",
+    "macros",
+] }
+bytes = "1"
+socket2 = { version = "0.6", features = ["all"] }
+futures = "0.3"
+
+# config / cli / observability
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ipnet = "2"
+url = "2"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+dashmap = "6"
+
+# local crates
+shadowlemon-crypto = { path = "crates/shadowlemon-crypto" }
+shadowlemon-wire = { path = "crates/shadowlemon-wire" }
+shadowlemon-protocol = { path = "crates/shadowlemon-protocol" }
+shadowlemon-socks5 = { path = "crates/shadowlemon-socks5" }
+shadowlemon-config = { path = "crates/shadowlemon-config" }
+shadowlemon-app = { path = "crates/shadowlemon-app" }
+
+# dev / fuzzing
+sha1 = "0.11"
+proptest = "1"
+tempfile = "3"
+assert_cmd = "2"
+libfuzzer-sys = "0.4"
+
+# Normal release builds: optimized and small, with a single codegen unit.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Size-optimized, abort-on-panic build for routers / mobile / embedded targets.
+# `opt-level = "z"` and `panic = "abort"` are intentionally confined here so
+# that `cargo test` keeps using the unwind-capable dev/test profiles.
+[profile.embedded]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

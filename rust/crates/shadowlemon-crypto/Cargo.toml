@@ -1,0 +1,38 @@
+[package]
+name = "shadowlemon-crypto"
+description = "Cipher suites, key derivation, X25519, AEAD framing and handshake envelopes for ShadowLemon V0.2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Drops egress/DNS, low-entropy nonce tricks and verbose logging. The crypto
+# crate has no such facilities, so this flag only changes the propagated
+# feature set; it is kept for a uniform binary feature graph.
+embedded = []
+android = []
+windows = []
+
+[dependencies]
+aead.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+pbkdf2.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+libfuzzer-sys.workspace = true
+proptest.workspace = true
+sha1.workspace = true
+
+[lints]
+workspace = true

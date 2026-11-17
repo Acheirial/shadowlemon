@@ -1,0 +1,47 @@
+[package]
+name = "shadowlemon-fuzz"
+description = "libFuzzer targets for ShadowLemon parsers"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+default = ["low-entropy"]
+# Mirror the wire crate's optional low-entropy transform in the fuzz target.
+low-entropy = ["shadowlemon-wire/low-entropy"]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+shadowlemon-crypto = { path = "../crates/shadowlemon-crypto" }
+shadowlemon-wire = { path = "../crates/shadowlemon-wire" }
+
+[[bin]]
+name = "handshake_request"
+path = "fuzz_targets/handshake_request.rs"
+test = false
+doc = false
+harness = false
+
+[[bin]]
+name = "handshake_response"
+path = "fuzz_targets/handshake_response.rs"
+test = false
+doc = false
+harness = false
+
+[[bin]]
+name = "parse_metadata"
+path = "fuzz_targets/parse_metadata.rs"
+test = false
+doc = false
+harness = false
+
+[[bin]]
+name = "decode_low_entropy"
+path = "fuzz_targets/decode_low_entropy.rs"
+test = false
+doc = false
+harness = false

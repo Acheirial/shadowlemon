@@ -1,24 +1,19 @@
-# third party source code
-/vendor
+# Rust build artifacts
+rust/target/
+rust/fuzz/target/
+**/*.rs.bk
+*.pdb
 
-# binaries
-/bin
-/release
-*.exe
-*.dll
-*.so
-*.dylib
-__pycache__/
+# Build outputs
+bin/
 
-# build tools
-/tools/build/**
+# Coverage and logs
+coverage.*
+*.log
 
-# code editors
+# Code editors
 /.vscode/
 
-# AI assistant context files (keep local only)
+# Local tools and AI assistant context files (keep local only)
+/tools/build/
 AGENTS.md
-
-# code coverage
-/coverage.out
-/coverage.html

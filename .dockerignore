@@ -1,11 +1,25 @@
 # Keep the Docker build context small. The only Dockerfile in this repository
 # (test/deploy/basic/Dockerfile) copies bin/* and test/deploy/basic/* only, so
-# nothing of what is ignored below is needed to build an image. A smaller
-# context makes `docker build` and the GitHub Actions cache upload faster.
+# nothing of what is ignored below is needed to build an image. In particular,
+# bin/ is NOT ignored: it holds the main binary and the four test helpers that
+# the image copies into the container.
+
+# Version control and CI
 .git
 .github
+
+# Cargo build outputs (sources are not needed in the image)
+rust/target
+rust/fuzz/target
+
+# Documentation not needed in the image
 *.md
-coverage.out
-coverage.html
+docs
+rust/docs
+configs
+
+# Local caches, coverage and logs
+coverage.*
+*.log
 tools/build
-bin/*.exe
+AGENTS.md

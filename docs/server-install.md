@@ -1,5 +1,7 @@
 # 服务器安装与配置
 
+> **本版本线协议版本为 4；两端必须使用同一版本，否则会话会在握手阶段失败。**
+
 代理服务器软件 `shadowlemon server` 需要运行在 Linux 系统中。
 
 ## 安装 shadowlemon 服务端
@@ -8,25 +10,44 @@
 
 ### 从源码编译
 
-按照[编译](./compile.md)文档准备好编译环境，然后在项目根目录运行：
+按照[编译](./compile.md)文档准备好 Rust 编译环境，然后在 `rust/` 目录运行：
 
 ```sh
-make
+export PATH="$HOME/.cargo/bin:$PATH"
+cd rust
+cargo build --release
 ```
 
-编译结果位于 `bin/` 目录。把 `shadowlemon` 复制到系统路径 `PATH` 即可，例如：
+编译结果为 `rust/target/release/shadowlemon`（显式指定目标三元组时位于 `rust/target/<target>/release/shadowlemon`）。也可以在仓库根目录运行 `make`（或 `make build` / `make rust-build`），它会额外把二进制复制到 `bin/shadowlemon`。把二进制复制到系统路径 `PATH` 即可，例如：
 
 ```sh
-sudo install -m 755 bin/shadowlemon /usr/local/bin/shadowlemon
+sudo install -m 755 rust/target/release/shadowlemon /usr/local/bin/shadowlemon
 ```
 
 ### 使用已编译的二进制
 
 如果你已经获得编译好的 `shadowlemon` 可执行文件，直接将其复制到系统路径 `PATH` 中即可，例如 `/usr/local/bin/`。
 
+### 二进制与配置文件位置
+
+可用子命令包括 `shadowlemon server run` / `start` / `stop` / `status` / `apply config <FILE>` / `replace config <FILE>` / `describe config` 等。二进制与配置文件的位置如下：
+
+| 项目 | 路径 |
+| :-- | :-- |
+| 编译产物 | `rust/target/release/shadowlemon`（显式指定目标三元组时位于 `rust/target/<target>/release/shadowlemon`；在仓库根目录运行 `make` 会另存一份为 `bin/shadowlemon`） |
+| 默认服务端配置 | `$XDG_CONFIG_HOME/shadowlemon/server.json`，未设置 `XDG_CONFIG_HOME` 时为 `~/.config/shadowlemon/server.json`（JSON） |
+| 环境变量覆盖 | `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` |
+
+JSON 字段名与格式见 `rust/docs/config-v0.2.md`。使用 systemd 时通常通过环境变量把配置指向 `/etc/shadowlemon/server.json`：
+
+```ini
+Environment=SHADOWLEMON_SERVER_CONFIG_JSON_FILE=/etc/shadowlemon/server.json
+ExecStart=/usr/bin/shadowlemon server run
+```
+
 ## 修改代理服务器设置
 
-shadowlemon 代理支持 TCP 和 UDP 两种不同的传输协议。要了解协议之间的差别，请阅读 [shadowlemon 代理协议](./protocol.md)。
+shadowlemon 代理支持 TCP 和 UDP 两种不同的传输协议。要了解协议之间的差别，请阅读 [ShadowLemon V0.2 协议规范](../rust/docs/protocol-v0.2.md)。
 
 用户可以通过
 
@@ -85,7 +106,7 @@ shadowlemon server replace config <FILE>
 4. 在 `users` -> `password` 属性中填写该用户的密码。
 5. 【可选】`mtu` 属性是使用 UDP 代理协议时网络路径的 L3 MTU，即能够通过的最大 IP 报文长度，取值范围是 1280 到 1500，默认值是 1400。UDP 的有效载荷预算会在此基础上另外扣除 IP 报文头与 UDP 报文头（IPv6 下最多 48 字节，即 40 字节 IPv6 头加 8 字节 UDP 头）。服务器与客户端必须使用相同的值。
 6. 【可选】建议将 `dns` -> `dualStack` 设置为 `PREFER_IPv4`，尤其是在服务器不支持 IPv6 时。其他选项和静态主机映射请参见 [DNS 策略](#dns-策略)。
-7. 【可选】`cipherSuites` 属性是服务端允许使用的密码套件列表，**列表顺序就是服务端的偏好顺序**。可以使用的值包括 `CIPHER_SUITE_XCHACHA20_POLY1305`，`CIPHER_SUITE_AES_256_GCM` 和 `CIPHER_SUITE_AES_128_GCM`。**未设置或者设置为空列表时，服务端接受全部三种套件**，与旧版本配置的行为一致。会话最终使用的套件由客户端与服务端在握手时协商决定，规则和适用场景见[密码套件](#密码套件)：服务端按自己的偏好顺序从交集中挑选，不按客户端首选套件（信封套件）的密钥长度过滤候选。
+7. 【可选】`cipherSuites` 属性是服务端允许使用的密码套件列表，**列表顺序就是服务端的偏好顺序**。可以使用的值包括 `CIPHER_SUITE_XCHACHA20_POLY1305`，`CIPHER_SUITE_AES_256_GCM` 和 `CIPHER_SUITE_AES_128_GCM`。**未设置或者设置为空列表时，服务端接受全部三种套件**。会话最终使用的套件由客户端与服务端在握手时协商决定，规则和适用场景见[密码套件](#密码套件)：服务端按自己的偏好顺序从交集中挑选，不按客户端首选套件（信封套件）的密钥长度过滤候选。
 
 用户与端口设置的取值需通过校验，否则 `shadowlemon server apply config` 会报错：
 
@@ -303,7 +324,7 @@ shadowlemon 客户端 -> 互联网 -> shadowlemon 服务器 -> cloudflare 代理
 
 ### 用户提示
 
-从 v3.31.0 版本开始，shadowlemon 客户端会在每个报文 nonce 的末尾附带 4 字节的用户提示（user hint），shadowlemon 服务器可以据此跳过明显不匹配的用户，减少对未认证首包的解密尝试次数。代理用户数量较多时，这尤其有帮助。客户端发送的是 keyed 提示：它由用户名与密码共同派生（其中的 pepper 以 `ShadowLemon V0.1 user hint pepper` 为种子字符串），旁观者只要不掌握凭据就无法算出，也无法用候选用户名去验证服务端注册了哪些用户。服务端只接受这一种提示，其它形式的提示不会被当作用户名提示。
+shadowlemon 客户端会在每个报文 nonce 的末尾附带 4 字节的用户提示（user hint），shadowlemon 服务器可以据此跳过明显不匹配的用户，减少对未认证首包的解密尝试次数。代理用户数量较多时，这尤其有帮助。客户端发送的是 keyed 提示：它由用户名与密码共同派生（V0.2 中的 pepper 种子字符串为 `ShadowLemon V0.2 user hint pepper`），旁观者只要不掌握凭据就无法算出，也无法用候选用户名去验证服务端注册了哪些用户。服务端只接受这一种提示，其它形式的提示不会被当作用户名提示。
 
 `advancedSettings` -> `userHintIsMandatory` 属性决定服务端是否强制要求首包携带匹配的用户名提示，**它的默认值是 `true`**：没有携带提示、或者提示与任何已注册用户都不匹配的报文会被直接丢弃，不会进入逐用户的试解密。这样一来，未认证首包的试解代价从 Θ(用户数 × 套件数) 降到只对提示匹配的少数用户尝试，显著降低了未认证流量放大服务端 CPU 消耗的风险。在提示为必需的前提下，某个源地址用同一提示试解失败后，其后续报文在 10 秒内会被负缓存直接拒绝，连试解密循环都不会进入；认证成功后该记录会被清除。这条负缓存只在要求提示时才生效，因为提示可选时「提示不匹配」可能只是报文没带提示。
 
@@ -317,7 +338,7 @@ shadowlemon 客户端 -> 互联网 -> shadowlemon 服务器 -> cloudflare 代理
 }
 ```
 
-把 `userHintIsMandatory` 显式设置为 `false` 之后，服务端必须对每一个候选用户、每一种套件、每一个时间槽分别尝试解密，未认证首包的试解代价回到 Θ(用户数 × 套件数) 次 AEAD 解封；用户数量较多时，很小的带宽就能把服务器的 CPU 打满，因此在没有明确需要时不要关闭它。用户提示本身不是认证信息——keyed 提示需要用户名与密码才能算出——它只影响查找代价，报文能否被接受始终取决于 AEAD 认证标签。
+把 `userHintIsMandatory` 显式设置为 `false` 之后，服务端必须对每一个候选用户、每一种套件分别尝试解密，未认证首包的试解代价回到 Θ(用户数 × 套件数) 次 AEAD 解封；用户数量较多时，很小的带宽就能把服务器的 CPU 打满，因此在没有明确需要时不要关闭它。用户提示本身不是认证信息——keyed 提示需要用户名与密码才能算出——它只影响查找代价，报文能否被接受始终取决于 AEAD 认证标签。
 
 ### 密码套件
 
@@ -332,31 +353,14 @@ shadowlemon 客户端 -> 互联网 -> shadowlemon 服务器 -> cloudflare 代理
 }
 ```
 
-可以使用的值包括 `CIPHER_SUITE_XCHACHA20_POLY1305`，`CIPHER_SUITE_AES_256_GCM` 和 `CIPHER_SUITE_AES_128_GCM`。未设置 `cipherSuites` 或者设置为空列表时，服务端接受全部三种套件，因此不含有该字段的旧版本配置文件可以继续使用，行为保持不变。
+可以使用的值包括 `CIPHER_SUITE_XCHACHA20_POLY1305`，`CIPHER_SUITE_AES_256_GCM` 和 `CIPHER_SUITE_AES_128_GCM`。未设置 `cipherSuites` 或者设置为空列表时，服务端接受全部三种套件。
 
 会话实际使用的套件由两端在握手时协商：先取「客户端偏好列表」与「服务端允许集合」的交集，再在交集中按**服务端偏好顺序**选出最终成员，因此最终套件可能不是客户端列表的第一项。挑选最终套件时**不**按密钥长度过滤：客户端把 `CIPHER_SUITE_AES_128_GCM`（16 字节密钥）排在首位，只决定保护握手请求（信封）的静态密钥长度为 16 字节，`CIPHER_SUITE_XCHACHA20_POLY1305` 与 `CIPHER_SUITE_AES_256_GCM`（都是 32 字节密钥）同样可以选择。交集为空时握手失败，服务端返回 `status` = 2、关闭会话并记录日志，因此两端至少要有共同的套件。
 
-一般建议保留默认行为：不在服务端限制套件，或者把 `CIPHER_SUITE_XCHACHA20_POLY1305` 写在列表的第一项，因为它的性能不依赖 CPU 的硬件特性。只有当服务器与客户端的 CPU 都支持 AES 硬件指令（x86 的 AES-NI、ARM 的 Crypto Extension）时，才建议把 `CIPHER_SUITE_AES_256_GCM` 排在前面；即使两端的 CPU 差异较大，只要双方都支持 AES-NI，也可以统一改用 AES-256-GCM。原理与适用场景见[密码套件](./protocol.md#密码套件)，运维和排查注意事项见[密码套件协商](./operation.md#密码套件协商)。
+一般建议保留默认行为：不在服务端限制套件，或者把 `CIPHER_SUITE_XCHACHA20_POLY1305` 写在列表的第一项，因为它的性能不依赖 CPU 的硬件特性。只有当服务器与客户端的 CPU 都支持 AES 硬件指令（x86 的 AES-NI、ARM 的 Crypto Extension）时，才建议把 `CIPHER_SUITE_AES_256_GCM` 排在前面；即使两端的 CPU 差异较大，只要双方都支持 AES-NI，也可以统一改用 AES-256-GCM。原理与适用场景见[密码套件](../rust/docs/protocol-v0.2.md#2-密码套件与密钥)，运维和排查注意事项见[密码套件协商](./operation.md#密码套件协商)。
 
-## 【可选】安装 NTP 网络时间同步服务
+## 关于系统时间同步
 
-客户端和代理服务器软件会根据用户名、密码和系统时间，分别计算密钥。只有当客户端和服务器的密钥相同时，服务器才能解密和响应客户端的请求。密钥派生使用 2 分钟粒度的时间槽，服务器会对当前时间槽以及向前、向后各一个时间槽（共 3 组时间盐）分别尝试解密，因此密钥层面可以容忍客户端时间槽 ±1 个时间槽（2 分钟）的偏差；但连接元数据中携带的时间戳以分钟为单位，只容忍 ±1 分钟的偏差。两者取更严格的一个，**实际生效的容忍区间是 ±1 分钟：客户端与服务器的时钟偏差一旦超过 1 分钟，握手就会失败**。请确保两端系统时间正确。
+V0.2 的静态密钥由固定的 `staticKeySalt` 派生，协议中不包含时间盐、时间槽或基于时间的元数据字段。因此客户端与服务端之间不存在「时钟偏差超过 1 分钟则握手失败」的限制，不需要为了握手成功而配置 NTP。
 
-为了保证服务器系统时间是精确的，我们建议用户启动或安装 NTP 网络时间服务。
-
-在 Linux 中，如果系统时间同步由 `systemd-timesyncd` 服务管理，你可以将 `/etc/systemd/timesyncd.conf` 配置文件更改为如下内容。
-
-```ini
-[Time]
-NTP=time.google.com
-```
-
-否则，使用下面的指令安装 NTP。
-
-```sh
-# Debian / Ubuntu
-sudo apt-get install ntp
-
-# RedHat / CentOS / Rocky Linux
-sudo dnf install ntp
-```
+当然，保持系统时间准确对日志排查、证书验证等仍然有意义，有需要时可按系统惯例启用 `systemd-timesyncd` 或安装 NTP 服务；这不是 shadowlemon 的协议要求。
