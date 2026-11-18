@@ -1,15 +1,14 @@
 //! Deployment-wide secret shared by all wire-visible fast filters.
 //!
 //! Values derived from this secret must never be guessable by a passive
-//! observer. The default is the historical [`crate::hint::USER_HINT_PEPPER`]
-//! (kept for backward compatibility); deployments should override it with the
-//! [`ENVELOPE_SECRET_ENV`] environment variable on **both** peers.
+//! observer. Both peers must set [`ENVELOPE_SECRET_ENV`] to the same
+//! high-entropy value. There is deliberately no built-in default: a published
+//! constant would let an observer derive the UDP routing envelope keystream
+//! and correlate sessions by their `kind` and session id.
 
 use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
-
-use crate::hint::USER_HINT_PEPPER;
 
 /// Environment variable holding the deployment secret (UTF-8, non-empty).
 pub const ENVELOPE_SECRET_ENV: &str = "SHADOWLEMON_ENVELOPE_SECRET";
@@ -21,16 +20,19 @@ static SECRET: OnceLock<Vec<u8>> = OnceLock::new();
 
 /// Returns the process-wide deployment secret.
 ///
-/// An empty or non-UTF-8 `SHADOWLEMON_ENVELOPE_SECRET` is ignored; in that case
-/// [`USER_HINT_PEPPER`] is used so existing deployments keep interoperating.
+/// Both peers must set `SHADOWLEMON_ENVELOPE_SECRET` to the same high-entropy
+/// value before start-up. Missing, empty or non-UTF-8 values are rejected: a
+/// published fallback would let a passive observer derive the routing envelope
+/// keystream from the per-packet nonce and recover `kind` / session ids.
 /// The value is read once and cached for the lifetime of the process.
 #[must_use]
 pub fn deployment_secret() -> &'static [u8] {
     SECRET.get_or_init(|| {
-        std::env::var(ENVELOPE_SECRET_ENV)
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map_or_else(|| USER_HINT_PEPPER.to_vec(), String::into_bytes)
+        let value = std::env::var(ENVELOPE_SECRET_ENV).unwrap_or_else(|_| {
+            panic!("{ENVELOPE_SECRET_ENV} must be set to the same high-entropy value on both peers")
+        });
+        assert!(!value.is_empty(), "{ENVELOPE_SECRET_ENV} must not be empty");
+        value.into_bytes()
     })
 }
 

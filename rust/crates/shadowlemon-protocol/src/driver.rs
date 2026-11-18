@@ -685,8 +685,22 @@ impl RealServerHandshake {
 
     fn expire_udp_sessions(&self) {
         let ttl = self.config.udp_session_ttl;
-        self.udp_sessions
-            .retain(|_, state| state.created.elapsed() < ttl && !state.is_closed());
+        let expired: Vec<(SocketAddr, u32)> = self
+            .udp_sessions
+            .iter()
+            .filter(|entry| {
+                let state = entry.value();
+                state.created.elapsed() >= ttl || state.is_closed()
+            })
+            .map(|entry| *entry.key())
+            .collect();
+        for key in expired {
+            if let Some((_, state)) = self.udp_sessions.remove(&key) {
+                // The flusher task holds an Arc<Self>, so dropping the registry
+                // entry alone cannot end it. Wake it explicitly.
+                state.shutdown.notify_one();
+            }
+        }
     }
 }
 
@@ -1192,7 +1206,14 @@ fn assemble_fragment(
     Some(out)
 }
 
-/// Split a datagram into MTU-sized encrypted application fragments.
+/// Split a datagram into fixed MTU-sized encrypted application fragments.
+///
+/// Fragment sizes are deliberately uniform. Attempts to randomize them (both a
+/// wide interval and a conservative last-two-fragment jitter) stalled large
+/// responses in practice: the user-space ARQ has no pacing, so uneven
+/// fragments interact badly with the send window and reassembly. Per-frame
+/// random padding at the wire layer already jitters datagram lengths. See
+/// `rust/docs/known-gaps.md` §8.
 fn fragment_payload(data: &[u8], max_fragment: usize, id: u32) -> io::Result<Vec<Vec<u8>>> {
     if max_fragment == 0 {
         return Err(invalid_data("UDP MTU leaves no room for application data"));
@@ -1459,6 +1480,8 @@ struct ServerUdpSession {
     pending_fragments: Mutex<VecDeque<Vec<u8>>>,
     /// Woken when an inbound frame (ACK) may unblock more reply frames.
     flusher_wake: Notify,
+    /// Signalled when the session expires so the reply flusher/ticker task exits.
+    shutdown: Notify,
     created: Instant,
     max_fragment: usize,
 }
@@ -1504,6 +1527,7 @@ impl ServerUdpSession {
             message_id: AtomicU32::new(1),
             pending_fragments: Mutex::new(VecDeque::new()),
             flusher_wake: Notify::new(),
+            shutdown: Notify::new(),
             created: Instant::now(),
             max_fragment,
         }
@@ -1597,15 +1621,26 @@ impl ServerUdpSession {
         self.send_reply_frames(frames).await;
     }
 
-    /// Start a background task that turns queued plaintext replies into
-    /// encrypted frames and sends them straight to the client on the shared
-    /// listener socket. It also flushes on each inbound ACK so large responses
-    /// keep flowing as the client's receive window advances.
+    /// Drive replies, ACKs, retransmissions and heartbeats from one background
+    /// task that sends frames straight to the client on the shared listener
+    /// socket. A single task owns `Session::tick`, so it is never called twice
+    /// for the same event. Inbound ACKs wake the task via `flusher_wake` so
+    /// large responses keep flowing as the receive window advances.
     fn spawn_reply_flusher(self: &Arc<Self>) {
         let state = Arc::clone(self);
         tokio::spawn(async move {
             loop {
+                let wait_until = {
+                    let session = state.session.lock().await;
+                    if session.is_closed() {
+                        break;
+                    }
+                    session
+                        .next_timer()
+                        .unwrap_or_else(|| Instant::now() + Duration::from_millis(50))
+                };
                 tokio::select! {
+                    _ = state.shutdown.notified() => break,
                     datagram = async {
                         let mut replies = state.replies.lock().await;
                         replies.recv().await
@@ -1614,6 +1649,12 @@ impl ServerUdpSession {
                         state.flush_reply(&datagram).await;
                     }
                     _ = state.flusher_wake.notified() => {
+                        state.flush_pending_output().await;
+                    }
+                    _ = tokio::time::sleep_until(wait_until.into()) => {
+                        // A heartbeat, delayed ACK or retransmission is due.
+                        // `flush_pending_output` calls `Session::tick` and
+                        // sends the resulting frames on the shared reply socket.
                         state.flush_pending_output().await;
                     }
                 }
@@ -1854,15 +1895,28 @@ mod tests {
 
     #[test]
     fn application_fragments_reassemble_in_descending_order() {
-        let data: Vec<u8> = (0..40u8).collect();
-        let pieces = fragment_payload(&data, 16, 9).unwrap();
-        // Piece sizes are randomized in [max/2, max], so the count varies.
-        assert!((3..=5).contains(&pieces.len()));
+        let data: Vec<u8> = (0..450usize).map(|i| i as u8).collect();
+        let pieces = fragment_payload(&data, 100, 9).unwrap();
+        // Fixed-size split: 450 / 100 = 5 fragments (including a short tail).
+        assert_eq!(pieces.len(), 5);
+        let count = pieces.len() as u8;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut rebuilt = Vec::new();
+        for piece in &pieces {
+            let (id, number, piece_count, chunk) = split_app_fragment(piece).unwrap();
+            assert_eq!(id, 9);
+            assert_eq!(piece_count, count);
+            seen.insert(number);
+            assert!(chunk.len() <= 100);
+            rebuilt.push((number, chunk));
+        }
+        assert_eq!(seen.len(), count as usize);
+        // Reassembly is independent of arrival order: feed high numbers first.
+        rebuilt.sort_by_key(|item| std::cmp::Reverse(item.0));
         let mut map = HashMap::new();
         let mut result = None;
-        for piece in pieces {
-            let (id, number, count, chunk) = split_app_fragment(&piece).unwrap();
-            result = assemble_fragment(&mut map, id, number, count, chunk);
+        for (number, chunk) in rebuilt {
+            result = assemble_fragment(&mut map, 9, number, count, chunk);
         }
         assert_eq!(result.unwrap(), data);
     }

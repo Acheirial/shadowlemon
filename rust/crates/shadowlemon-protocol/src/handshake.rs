@@ -50,6 +50,13 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const TYPE_OPEN_SESSION_REQUEST: u8 = 2;
 /// Protocol type of `openSessionResponse`.
 pub const TYPE_OPEN_SESSION_RESPONSE: u8 = 3;
+/// Random reduction applied to the piggyback capacity of a handshake request.
+///
+/// The resulting request payload length is drawn from
+/// `MAX_SESSION_PAYLOAD - PIGGYBACK_SLACK ..= MAX_SESSION_PAYLOAD`, so the
+/// first datagram of a session overlaps the regular data-frame size range
+/// instead of standing out as a fixed-size beacon.
+const PIGGYBACK_SLACK: usize = 28;
 
 /// Which framing rules the surrounding connection uses.
 ///
@@ -498,10 +505,14 @@ impl ClientHandshake {
         };
         request.validate()?;
         let request_bytes = request.marshal();
-        let capacity = self.piggyback_capacity();
+        // Draw the piggyback region length from a wide interval so the first
+        // datagram of a session is not a fixed-size fingerprint. The upper
+        // bound stays inside the MTU budget even with the maximum suffix; the
+        // lower bound keeps the frame within the size range of data frames.
+        let capacity = self.piggyback_capacity() - rand::random_range(0..=PIGGYBACK_SLACK);
         // Two bytes are reserved for the length prefix; the rest of the region
-        // is filled with random bytes so every request has the same encrypted
-        // length regardless of the piggyback's real size.
+        // is filled with random bytes so the ciphertext length does not reveal
+        // the piggyback's real size.
         let usable = capacity.saturating_sub(2);
         let attached = piggyback.len().min(usable);
         let attached_len = u16::try_from(attached).expect("piggyback fits capacity");
@@ -1182,11 +1193,12 @@ mod tests {
         .unwrap();
 
         let request = client.build_request(b"").unwrap();
-        // The piggyback region is always padded to the full session payload, so
-        // only the random suffix changes the overall frame length.
-        let base =
-            WIRE_NONCE_LEN + META_BLOCK_LEN + shadowlemon_wire::MAX_SESSION_PAYLOAD + AEAD_TAG_LEN;
-        assert!((base..=base + MAX_SUFFIX_PADDING).contains(&request.len()));
+        // The piggyback region length is drawn from a wide interval, so the
+        // first frame's length varies independently of the random suffix.
+        let overhead = WIRE_NONCE_LEN + META_BLOCK_LEN + AEAD_TAG_LEN;
+        let min = overhead + shadowlemon_wire::MAX_SESSION_PAYLOAD - PIGGYBACK_SLACK;
+        let max = overhead + shadowlemon_wire::MAX_SESSION_PAYLOAD + MAX_SUFFIX_PADDING;
+        assert!((min..=max).contains(&request.len()));
         let response = match server.accept(&request).unwrap() {
             ServerHandshakeResult::Established { response, .. } => response,
             _ => panic!("unexpected result"),

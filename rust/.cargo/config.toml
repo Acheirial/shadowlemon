@@ -1,0 +1,6 @@
+# Test-only deployment secret. The binary requires SHADOWLEMON_ENVELOPE_SECRET
+# at runtime; this makes `cargo test` and local builds self-contained. Real
+# deployments must set the variable to their own high-entropy value on both
+# peers (see docs/operation.md).
+[env]
+SHADOWLEMON_ENVELOPE_SECRET = "shadowlemon-test-only-deployment-secret-do-not-use-in-production"

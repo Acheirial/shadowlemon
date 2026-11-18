@@ -12,6 +12,9 @@ Group=shadowlemon
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 Environment="SHADOWLEMON_SERVER_CONFIG_YAML_FILE=/etc/shadowlemon_server_config.yaml"
 Environment="SHADOWLEMON_LOG_NO_TIMESTAMP=true"
+# Required on both peers; store the shared high-entropy value in this
+# root-owned, mode 0600 file (same value as on the client).
+EnvironmentFile=/etc/shadowlemon/envelope-secret.env
 ExecStartPre=+/usr/bin/mkdir -p /var/run/shadowlemon
 ExecStartPre=+/usr/bin/chown -R shadowlemon:shadowlemon /var/run/shadowlemon
 ExecStartPre=+/usr/bin/chmod 775 /var/run/shadowlemon

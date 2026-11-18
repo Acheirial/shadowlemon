@@ -8,6 +8,9 @@ StartLimitIntervalSec=60
 [Service]
 Type=exec
 Environment="SHADOWLEMON_CLIENT_CONFIG_YAML_FILE=/etc/shadowlemon_client_config.yaml"
+# SHADOWLEMON_ENVELOPE_SECRET is required; keep it out of the unit file and
+# define it in this file with mode 0600 on both peers (same high-entropy value).
+EnvironmentFile=/etc/shadowlemon/envelope-secret.env
 ExecStart=/usr/bin/shadowlemon client run
 Restart=on-failure
 RestartSec=1

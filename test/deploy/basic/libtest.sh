@@ -25,6 +25,11 @@
 # "UDP" means UDP ASSOCIATE datagrams (PacketUnderlay). Both use UDP bindings.
 TEST_BINARY=${TEST_BINARY:-./shadowlemon}
 
+# Both peers require the same deployment secret for the UDP routing envelope.
+# The integration suite uses a fixed test-only value; real deployments set
+# their own high-entropy value on both endpoints.
+export SHADOWLEMON_ENVELOPE_SECRET="${SHADOWLEMON_ENVELOPE_SECRET:-shadowlemon-test-only-deployment-secret-do-not-use-in-production}"
+
 # The Rust daemon redirects stdout/stderr to /dev/null. Scenarios that inspect
 # the negotiated cipher suite therefore run the client in the foreground and
 # capture its tracing output here.

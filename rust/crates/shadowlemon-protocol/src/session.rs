@@ -1300,6 +1300,19 @@ mod tests {
     }
 
     #[test]
+    fn server_heartbeat_fires_on_timer_without_sleeping() {
+        // The server used to rely on inbound traffic to drive `tick`, so an
+        // idle session never sent a heartbeat. Both directions now schedule a
+        // heartbeat from `next_timer`.
+        let (_, mut server) = pair(TransportMode::Datagram);
+        let deadline = server.next_timer().expect("server heartbeat timer");
+        server.tick(deadline).unwrap();
+        assert!(server.has_output());
+        let next = server.next_timer().expect("next server heartbeat");
+        assert!(next > deadline);
+    }
+
+    #[test]
     fn close_request_answers_with_close_response() {
         let (mut client, mut server) = pair(TransportMode::Datagram);
         let now = Instant::now();

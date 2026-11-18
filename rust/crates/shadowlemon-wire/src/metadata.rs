@@ -661,10 +661,11 @@ mod tests {
         );
 
         let mut bad = SESSION_GOLDEN;
-        bad[10..12].copy_from_slice(&1025u16.to_be_bytes());
+        let too_long = (crate::MAX_SESSION_PAYLOAD + 1) as u16;
+        bad[10..12].copy_from_slice(&too_long.to_be_bytes());
         assert_eq!(
             Metadata::parse(&bad).unwrap_err(),
-            WireError::SessionPayloadTooLong(1025)
+            WireError::SessionPayloadTooLong(usize::from(too_long))
         );
 
         let mut bad = DATA_GOLDEN;

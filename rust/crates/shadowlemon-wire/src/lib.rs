@@ -38,7 +38,12 @@ pub const METADATA_LEN: usize = 32;
 /// AEAD authentication tag length for every supported suite.
 pub const TAG_LEN: usize = 16;
 /// Maximum payload length in session metadata (types 2–5).
-pub const MAX_SESSION_PAYLOAD: usize = 1024;
+///
+/// The handshake request uses this budget for its piggyback region. The value
+/// is sized so a request frame (5-byte routing envelope + 24-byte nonce +
+/// 48-byte metadata block + payload + 16-byte tag + up to 32-byte suffix)
+/// still fits the IPv6 MTU budget (1347 bytes at the default MTU of 1400).
+pub const MAX_SESSION_PAYLOAD: usize = 1236;
 /// Maximum application fragment length in data metadata (types 6–11).
 pub const MAX_FRAGMENT: usize = 32768;
 /// Wire nonce byte flipped to derive a UDP payload nonce (spec §4.2).

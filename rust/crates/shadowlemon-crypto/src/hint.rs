@@ -12,10 +12,6 @@ use crate::{
     constant_time_eq, deployment::deployment_secret, WireNonce, HINT_LEN, HINT_NONCE_PREFIX_LEN,
 };
 
-/// Default domain separator of the keyed user hint, retained for backward
-/// compatibility. It is used only when no deployment secret is configured.
-pub const USER_HINT_PEPPER: &[u8] = b"ShadowLemon V0.2 user hint pepper";
-
 /// Compute the four-byte keyed hint of `username` for a wire nonce:
 /// `SHA256(deployment_secret() || username || nonce[0:16])[0:4]`.
 #[must_use]
@@ -54,7 +50,7 @@ mod tests {
         let nonce = [0x11u8; 24];
         let hint = user_hint(b"alice", &nonce);
         let mut input = Vec::new();
-        input.extend_from_slice(USER_HINT_PEPPER);
+        input.extend_from_slice(deployment_secret());
         input.extend_from_slice(b"alice");
         input.extend_from_slice(&nonce[..16]);
         let digest = Sha256::digest(&input);
