@@ -7,7 +7,7 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=exec
-Environment="SHADOWLEMON_CLIENT_CONFIG_JSON_FILE=/etc/shadowlemon_client_config.json"
+Environment="SHADOWLEMON_CLIENT_CONFIG_YAML_FILE=/etc/shadowlemon_client_config.yaml"
 ExecStart=/usr/bin/shadowlemon client run
 Restart=on-failure
 RestartSec=1

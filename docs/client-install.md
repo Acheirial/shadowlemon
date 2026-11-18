@@ -31,13 +31,13 @@ cargo build --release
 | 项目 | 路径 |
 | :-- | :-- |
 | 编译产物 | `rust/target/release/shadowlemon`（显式指定目标三元组时位于 `rust/target/<target>/release/shadowlemon`；在仓库根目录运行 `make` 会另存一份为 `bin/shadowlemon`） |
-| 默认客户端配置 | `$XDG_CONFIG_HOME/shadowlemon/client.json`，未设置 `XDG_CONFIG_HOME` 时为 `~/.config/shadowlemon/client.json`（JSON） |
-| 环境变量覆盖 | `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` |
+| 默认客户端配置 | `$XDG_CONFIG_HOME/shadowlemon/client.yaml`，未设置 `XDG_CONFIG_HOME` 时为 `~/.config/shadowlemon/client.yaml`（YAML，推荐） |
+| 环境变量覆盖 | `SHADOWLEMON_CLIENT_CONFIG_YAML_FILE`；`SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` 用于旧的 JSON 文件 |
 
-JSON 字段名与格式见 `rust/docs/config-v0.2.md`。如需从自定义路径加载配置（例如 OpenWrt 上的 `/etc/shadowlemon_client_config.json`），使用：
+字段名与格式见 `rust/docs/config-v0.2.md`。两种格式字段名相同；若同目录已有旧的 `client.json`，会继续使用它并提示迁移。如需从自定义路径加载配置（例如 OpenWrt 上的 `/etc/shadowlemon_client_config.yaml`），使用：
 
 ```sh
-SHADOWLEMON_CLIENT_CONFIG_JSON_FILE=/etc/shadowlemon_client_config.json shadowlemon client run
+SHADOWLEMON_CLIENT_CONFIG_YAML_FILE=/etc/shadowlemon_client_config.yaml shadowlemon client run
 ```
 
 ## 修改客户端的设置
@@ -128,7 +128,7 @@ shadowlemon client replace config <FILE>
 
 如果你安装了多台代理服务器，或者一台服务器监听多个端口，可以把它们都添加到客户端设置中。每次发起新的连接时，客户端会随机选取其中的一台服务器和一个端口。**如果使用了多台服务器，请确保每一台服务器都启动了 `shadowlemon server`。**
 
-假设这个配置文件的文件名是 `client_config.json`，在修改完成之后，调用指令 `shadowlemon client apply config client_config.json` 写入该配置。
+假设这个配置文件的文件名是 `client_config.yaml`，在修改完成之后，调用指令 `shadowlemon client apply config client_config.yaml` 写入该配置。
 
 如果配置有误，客户端会打印出现的问题。请根据提示修改配置文件，重新运行 `shadowlemon client apply config <FILE>` 指令写入修正后的配置。
 

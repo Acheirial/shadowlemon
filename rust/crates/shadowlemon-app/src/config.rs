@@ -1,11 +1,11 @@
 //! Configuration discovery, environment compatibility and driver translation.
 //!
-//! The JSON file names come from `shadowlemon_config` (`client.json` /
-//! `server.json`). Existing deployments may point at a different file with
-//! `SHADOWLEMON_{CLIENT,SERVER}_CONFIG_JSON_FILE`; the older
-//! `SHADOWLEMON_{CLIENT,SERVER}_CONFIG_FILE` variable is still recognised but a
-//! protobuf payload is rejected with an actionable error instead of being
-//! silently mis-parsed as JSON.
+//! The default file names come from `shadowlemon_config` (`client.yaml` /
+//! `server.yaml`); an existing `.json` file is still honoured. Deployments may
+//! point at another file with `SHADOWLEMON_{CLIENT,SERVER}_CONFIG_YAML_FILE` or
+//! `..._CONFIG_JSON_FILE`. The generic `..._CONFIG_FILE` variable accepts
+//! either format, but rejects the old protobuf payload with an actionable
+//! error instead of silently mis-parsing it.
 
 use std::{
     fs,
@@ -14,7 +14,7 @@ use std::{
 
 use crate::AppError;
 use shadowlemon_config::{
-    config_dir, config_suite_to_wire, load_json, CipherSuite, ClientConfig, ClientProfile, Egress,
+    config_dir, config_suite_to_wire, load, CipherSuite, ClientConfig, ClientProfile, Egress,
     LoggingLevel, MultiplexingLevel, ServerConfig,
 };
 use shadowlemon_crypto::suite::Suite;
@@ -50,35 +50,36 @@ impl Mode {
 /// Resolve the configuration path, honouring the deployment environment
 /// variables described in the module docs.
 pub fn config_path(mode: Mode) -> Result<PathBuf, AppError> {
-    let (json_var, legacy_var) = match mode {
+    let (yaml_var, json_var, generic_var) = match mode {
         Mode::Client => (
+            "SHADOWLEMON_CLIENT_CONFIG_YAML_FILE",
             "SHADOWLEMON_CLIENT_CONFIG_JSON_FILE",
             "SHADOWLEMON_CLIENT_CONFIG_FILE",
         ),
         Mode::Server => (
+            "SHADOWLEMON_SERVER_CONFIG_YAML_FILE",
             "SHADOWLEMON_SERVER_CONFIG_JSON_FILE",
             "SHADOWLEMON_SERVER_CONFIG_FILE",
         ),
     };
-    if let Some(path) = std::env::var_os(json_var) {
-        if !path.is_empty() {
-            return Ok(PathBuf::from(path));
+    for var in [yaml_var, json_var] {
+        if let Some(path) = std::env::var_os(var) {
+            if !path.is_empty() {
+                return Ok(PathBuf::from(path));
+            }
         }
     }
-    if let Some(path) = std::env::var_os(legacy_var) {
+    if let Some(path) = std::env::var_os(generic_var) {
         if !path.is_empty() {
             let path = PathBuf::from(path);
-            match fs::read(&path) {
-                Ok(bytes) if !looks_like_json(&bytes) => {
-                    return Err(AppError::Config(format!(
-                        "{legacy_var} points at {}: protobuf configuration is no longer \
-                         supported; convert it to JSON (see configs/examples)",
-                        path.display()
-                    )));
+            match fs::read_to_string(&path) {
+                Ok(text) if looks_like_config(&text) => return Ok(path),
+                Ok(_) => return Err(protobuf_error(generic_var, &path)),
+                // Binary protobuf is not valid UTF-8.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err(protobuf_error(generic_var, &path));
                 }
-                Ok(_) => return Ok(path),
-                // A missing legacy path is handled by the normal loader, which
-                // reports the canonical "file not found" error.
+                // A missing file is reported by the normal loader.
                 Err(_) => return Ok(path),
             }
         }
@@ -89,22 +90,30 @@ pub fn config_path(mode: Mode) -> Result<PathBuf, AppError> {
     })
 }
 
-fn looks_like_json(bytes: &[u8]) -> bool {
-    let trimmed = bytes
-        .iter()
-        .copied()
-        .find(|byte| !byte.is_ascii_whitespace());
-    trimmed == Some(b'{')
+fn protobuf_error(var: &str, path: &Path) -> AppError {
+    AppError::Config(format!(
+        "{var} points at {}: protobuf configuration is no longer supported; \
+         convert it to YAML (see configs/examples)",
+        path.display()
+    ))
+}
+
+fn looks_like_config(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.is_empty()
+        || trimmed.starts_with('{')
+        || trimmed.starts_with("---")
+        || trimmed.lines().any(|line| line.contains(':'))
 }
 
 /// Load a client config from `path` (already selected by [`config_path`]).
 pub fn load_client(path: &Path) -> Result<ClientConfig, AppError> {
-    Ok(load_json::<ClientConfig>(path)?)
+    Ok(load::<ClientConfig>(path)?)
 }
 
 /// Load a server config from `path`.
 pub fn load_server(path: &Path) -> Result<ServerConfig, AppError> {
-    Ok(load_json::<ServerConfig>(path)?)
+    Ok(load::<ServerConfig>(path)?)
 }
 
 /// Pick the active profile from a client config.

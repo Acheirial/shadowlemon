@@ -40,14 +40,14 @@ Rust 工具链默认把 `cargo` / `rustc` 安装到 `~/.cargo/bin`，若该目�
 
 ### 2. 应用配置
 
-配置格式与示例见 [`configs/examples/`](./configs/examples/) 和 [`docs/`](./docs/)。分别编写服务器端与客户端的 JSON 配置文件后，用 `apply` 子命令写入：
+配置格式与示例见 [`configs/examples/`](./configs/examples/) 和 [`docs/`](./docs/)。推荐用 YAML 编写服务器端与客户端配置文件（JSON 仍可用但不推荐），然后用 `apply` 子命令写入：
 
 ```sh
 # 服务器端
-shadowlemon server apply config server_config.json
+shadowlemon server apply config server_config.yaml
 
 # 客户端
-shadowlemon client apply config client_config.json
+shadowlemon client apply config client_config.yaml
 ```
 
 ### 3. 启动

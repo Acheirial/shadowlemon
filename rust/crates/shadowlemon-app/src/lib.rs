@@ -16,8 +16,8 @@ use std::{fs, path::PathBuf, sync::OnceLock};
 
 use clap::{Args, Parser, Subcommand};
 use shadowlemon_config::{
-    apply_file, describe_file, export_full_url, export_simple_urls, import_url, replace_file,
-    write_atomic, ClientConfig, ServerConfig,
+    apply_file_auto, describe_file_auto, export_full_url, export_simple_urls, import_url,
+    replace_file_auto, write_auto, ClientConfig, ServerConfig,
 };
 use thiserror::Error;
 use tracing::{Event, Subscriber};
@@ -153,7 +153,7 @@ pub enum ClientCommand {
     Status,
     /// Run the client in the foreground.
     Run,
-    /// Merge a JSON patch into the client configuration.
+    /// Merge a YAML or JSON patch into the client configuration.
     Apply(ConfigFileArgs),
     /// Replace the client configuration wholesale.
     Replace(ConfigFileArgs),
@@ -178,7 +178,7 @@ pub enum ServerCommand {
     Status,
     /// Run the server in the foreground.
     Run,
-    /// Merge a JSON patch into the server configuration.
+    /// Merge a YAML or JSON patch into the server configuration.
     Apply(ConfigFileArgs),
     /// Replace the server configuration wholesale.
     Replace(ConfigFileArgs),
@@ -314,7 +314,7 @@ fn run_client_cli(command: ClientCommand) -> Result<(), AppError> {
             init_logging(tracing::Level::INFO);
             let _ = args.target;
             let path = config::config_path(Mode::Client)?;
-            println!("{}", describe_file::<ClientConfig>(&path)?);
+            println!("{}", describe_file_auto::<ClientConfig>(&path)?);
             Ok(())
         }
         ClientCommand::Import(args) => {
@@ -322,7 +322,7 @@ fn run_client_cli(command: ClientCommand) -> Result<(), AppError> {
             let ImportTarget::Config { url } = args.target;
             let path = config::config_path(Mode::Client)?;
             let imported = import_url(&url).map_err(|error| AppError::Url(error.to_string()))?;
-            write_atomic(&path, &imported)?;
+            write_auto(&path, &imported)?;
             println!("imported client configuration from {}", path.display());
             Ok(())
         }
@@ -385,7 +385,7 @@ fn run_server_cli(command: ServerCommand) -> Result<(), AppError> {
             init_logging(tracing::Level::INFO);
             let _ = args.target;
             let path = config::config_path(Mode::Server)?;
-            println!("{}", describe_file::<ServerConfig>(&path)?);
+            println!("{}", describe_file_auto::<ServerConfig>(&path)?);
             Ok(())
         }
         ServerCommand::Version => {
@@ -400,18 +400,10 @@ fn edit_config(mode: Mode, args: ConfigFileArgs, apply: bool) -> Result<(), AppE
     let patch = fs::read_to_string(&file)?;
     let path = config::config_path(mode)?;
     let described = match (mode, apply) {
-        (Mode::Client, true) => {
-            shadowlemon_config::describe(&apply_file::<ClientConfig>(&path, &patch)?)?
-        }
-        (Mode::Server, true) => {
-            shadowlemon_config::describe(&apply_file::<ServerConfig>(&path, &patch)?)?
-        }
-        (Mode::Client, false) => {
-            shadowlemon_config::describe(&replace_file::<ClientConfig>(&path, &patch)?)?
-        }
-        (Mode::Server, false) => {
-            shadowlemon_config::describe(&replace_file::<ServerConfig>(&path, &patch)?)?
-        }
+        (Mode::Client, true) => apply_file_auto::<ClientConfig>(&path, &patch)?,
+        (Mode::Server, true) => apply_file_auto::<ServerConfig>(&path, &patch)?,
+        (Mode::Client, false) => replace_file_auto::<ClientConfig>(&path, &patch)?,
+        (Mode::Server, false) => replace_file_auto::<ServerConfig>(&path, &patch)?,
     };
     println!("{described}");
     Ok(())

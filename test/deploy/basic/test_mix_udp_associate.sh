@@ -56,8 +56,8 @@ sleep 1
 "$TEST_BINARY" client export config simple
 sleep 1
 "$TEST_BINARY" client export config > client.url.txt
-# Remove the saved config before re-importing.
-rm -f ~/.config/shadowlemon/client.json
+# Remove the saved config before re-importing (default is YAML, JSON is legacy).
+rm -f ~/.config/shadowlemon/client.yaml ~/.config/shadowlemon/client.json
 sleep 1
 echo "client config before import:"
 "$TEST_BINARY" client describe config

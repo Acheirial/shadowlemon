@@ -1,8 +1,8 @@
 # ShadowLemon V0.2 配置规范（Rust 重写版）
 
-本文描述 ShadowLemon V0.2（Rust 重写）的客户端/服务端配置格式与行为。**JSON 字段名与形状保持与 Go V0.1 一致**，因此现有 `configs/examples/*.json` 可被 Rust 版本直接加载。协议层的破坏性变更（版本 4、移除时间盐、移除 timestamp、低熵简化）**不体现在 JSON 字段名上**——没有新增时间相关字段，也没有需要改名的字段。V0.2 删除了从未接入数据面的 `trafficPattern` 与服务端 `dns`：含这些字段的旧配置仍可加载（未知字段被忽略），但它们不再被解析，也不再影响流量形态。
+本文描述 ShadowLemon V0.2（Rust 重写）的客户端/服务端配置格式与行为。**推荐格式是 YAML**（`client.yaml` / `server.yaml`，见 `configs/examples/*.yaml`）。JSON 仍然完全支持，用于兼容现有配置和自动化工具，但**不推荐**：程序读到 JSON 时会打印一次迁移提示，写回时仅 `.json` 路径保留 JSON。两种格式使用**完全相同的字段名与形状**，并保持与 Go V0.1 一致，因此现有 `configs/examples/*.json` 可被 Rust 版本直接加载。协议层的破坏性变更（版本 4、移除时间盐、移除 timestamp、低熵简化）**不体现在配置字段名上**——没有新增时间相关字段，也没有需要改名的字段。V0.2 删除了从未接入数据面的 `trafficPattern` 与服务端 `dns`：含这些字段的旧配置仍可加载（未知字段被忽略），但它们不再被解析，也不再影响流量形态。
 
-> 底层数据模型在 Go 中是 protobuf（见 `pkg/appctl/proto/*.proto`），Rust 版本用 **serde** 直接对同样的 JSON 形状做序列化/反序列化。枚举在 JSON 中以**字符串枚举名**表示（例如 `"CIPHER_SUITE_AES_256_GCM"`），而非数字。
+> 底层数据模型在 Go 中是 protobuf（见 `pkg/appctl/proto/*.proto`），Rust 版本用 **serde** 对同样的字段形状做序列化/反序列化。枚举以**字符串枚举名**表示（例如 `CIPHER_SUITE_AES_256_GCM`），而非数字。格式按**文件内容**自动识别（以 `{` 开头视为 JSON，否则按 YAML 解析），与文件扩展名无关；写回时按扩展名决定格式。
 
 ---
 
@@ -10,10 +10,33 @@
 
 配置分两类：
 
-- **客户端配置** `ClientConfig`：对应 `configs/examples/client_config*.json`。
-- **服务端配置** `ServerConfig`：对应 `configs/examples/server_config*.json`。
+- **客户端配置** `ClientConfig`：对应 `configs/examples/client_config*.yaml` / `*.json`。
+- **服务端配置** `ServerConfig`：对应 `configs/examples/server_config*.yaml` / `*.json`。
 
-二者都是单个 JSON 对象，所有字段均为 optional（serde 中带 `#[serde(default)]`），缺失时使用默认值。枚举字符串大小写敏感，必须与下表枚举名完全一致（未知枚举名在校验阶段报错）。
+二者都是单个 YAML 映射（或等价的 JSON 对象），所有字段均为 optional（serde 中带 `#[serde(default)]`），缺失时使用默认值。枚举字符串大小写敏感，必须与下表枚举名完全一致（未知枚举名在校验阶段报错）。
+
+最小可用示例（YAML）：
+
+```yaml
+# client.yaml
+profiles:
+  - profileName: default
+    user: { name: user1, password: password1 }
+    servers:
+      - ipAddress: "12.34.56.78"
+        portBindings:
+          - { portRange: "2012-2022", protocol: UDP }
+activeProfile: default
+socks5Port: 1080
+```
+
+```yaml
+# server.yaml
+portBindings:
+  - { portRange: "2012-2022", protocol: UDP }
+users:
+  - { name: user1, password: password1 }
+```
 
 ---
 
@@ -219,15 +242,16 @@ CLI 行为与 Go 版本一致（对应 `pkg/cli/client.go`、`pkg/cli/server.go`
 
 | 命令 | 行为 |
 | :-- | :-- |
-| `apply config <json>` | 把输入 JSON 作为**合并补丁**应用到当前配置。规则：标量字段出现即覆盖；对象字段递归合并（子对象中未出现的键保持不变）；`null` 表示删除该键；数组字段整体替换（不做逐元素合并），因此修改 `profiles`/`users` 时需提交完整数组。合并后整体校验。 |
-| `replace config <json>` | 用输入 JSON **整体替换**当前配置（先校验通过再原子落盘）。 |
-| `describe config` | 输出当前配置的 JSON 表示（若配置文件不存在，先落盘一个空配置再输出）。 |
+| `apply config <文件>` | 把输入 YAML（或 JSON）作为**合并补丁**应用到当前配置。规则：标量字段出现即覆盖；对象字段递归合并（子对象中未出现的键保持不变）；`null` 表示删除该键；数组字段整体替换（不做逐元素合并），因此修改 `profiles`/`users` 时需提交完整数组。合并后整体校验。 |
+| `replace config <文件>` | 用输入 YAML（或 JSON）**整体替换**当前配置（先校验通过再原子落盘）。 |
+| `describe config` | 按当前配置文件的格式输出（YAML 文件输出 YAML，JSON 文件输出 JSON；若文件不存在，先落盘一个空 YAML 配置再输出）。 |
 
 实现要点：
 
-- 三种操作都先反序列化为相同 schema，再执行校验；`replace` 必须整体校验通过后才写入，`apply` 合并后也必须整体校验通过。
+- 三种操作都先反序列化为相同 schema，再执行校验；`replace` 必须整体校验通过后才写入，`apply` 合并后也必须整体校验通过。补丁格式按内容自动识别，落盘格式由目标文件扩展名决定（`.json` 保持 JSON，其余写 YAML）。
 - 落盘采用「写临时文件 + 原子重命名」，避免部分写入损坏配置。
-- 文件路径：Linux 通常 `~/.config/shadowlemon`，macOS `~/Library/Application Support/shadowlemon`，Windows `%AppData%\shadowlemon`（与 Go 一致）。
+- 默认文件路径：Linux 通常 `~/.config/shadowlemon/client.yaml`（服务端 `server.yaml`），macOS `~/Library/Application Support/shadowlemon`，Windows `%AppData%\shadowlemon`。若同目录下已存在旧的 `client.json` / `server.json`，则继续使用它（并提示迁移到 YAML）。
+- 环境变量：`SHADOWLEMON_{CLIENT,SERVER}_CONFIG_YAML_FILE` 指定 YAML 文件；`..._CONFIG_JSON_FILE` 指定 JSON 文件；通用的 `..._CONFIG_FILE` 接受两种格式，但拒绝旧 protobuf 内容。
 
 ---
 

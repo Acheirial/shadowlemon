@@ -146,8 +146,8 @@ unknown field `portBindings`, expected one of ...
 请使用匹配的命令：
 
 ```sh
-shadowlemon server apply config <server_config.json>
-shadowlemon client apply config <client_config.json>
+shadowlemon server apply config <server_config.yaml>
+shadowlemon client apply config <client_config.yaml>
 ```
 
 另外，配置中可能含有当前 schema 不支持的字段：客户端配置里的 `httpProxyPort`、`httpProxyListenLAN`、`noCheckUpdate`、`rpcPort` 与 `advancedSettings`，以及服务器配置里 `users` 下的 `quotas`。请先从配置文件中删除这些字段，再重新应用。
@@ -197,25 +197,25 @@ shadowlemon client apply config <client_config.json>
 
 ## 配置文件存放位置
 
-V0.2 把配置以 JSON 格式保存，默认文件名为 `client.json` / `server.json`。JSON 字段名与格式见 `rust/docs/config-v0.2.md`。
+V0.2 推荐用 YAML 格式保存配置，默认文件名为 `client.yaml` / `server.yaml`；JSON 仍可加载但不推荐（会打印迁移提示），旧的 `.json` 文件会被继续使用。字段名与格式见 `rust/docs/config-v0.2.md`。
 
 ### 服务器
 
 | 文件 | 默认路径 | 格式 |
 |------|----------|------|
-| 配置 | `$XDG_CONFIG_HOME/shadowlemon/server.json`，未设置 `XDG_CONFIG_HOME` 时为 `~/.config/shadowlemon/server.json` | JSON |
+| 配置 | `$XDG_CONFIG_HOME/shadowlemon/server.yaml`，未设置 `XDG_CONFIG_HOME` 时为 `~/.config/shadowlemon/server.yaml` | YAML（旧的 `.json` 仍可用） |
 
-使用 systemd 时通常通过环境变量 `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` 把配置指向 `/etc/shadowlemon/server.json`。服务器**不**存储密码明文，仅保存校验码。
+使用 systemd 时通常通过环境变量 `SHADOWLEMON_SERVER_CONFIG_YAML_FILE` 把配置指向 `/etc/shadowlemon/server.yaml`。服务器**不**存储密码明文，仅保存校验码。
 
 ### 客户端
 
 | 操作系统 | 配置路径 | 示例 |
 |----------|----------|------|
-| Linux | `$XDG_CONFIG_HOME/shadowlemon/client.json` 或 `~/.config/shadowlemon/client.json` | `/home/enfein/.config/shadowlemon/client.json` |
-| macOS | `$HOME/Library/Application Support/shadowlemon/client.json` | `/Users/enfein/Library/Application Support/shadowlemon/client.json` |
-| Windows | `%AppData%\shadowlemon\client.json` | `C:\Users\enfein\AppData\Roaming\shadowlemon\client.json` |
+| Linux | `$XDG_CONFIG_HOME/shadowlemon/client.yaml` 或 `~/.config/shadowlemon/client.yaml` | `/home/enfein/.config/shadowlemon/client.yaml` |
+| macOS | `$HOME/Library/Application Support/shadowlemon/client.yaml` | `/Users/enfein/Library/Application Support/shadowlemon/client.yaml` |
+| Windows | `%AppData%\shadowlemon\client.yaml` | `C:\Users\enfein\AppData\Roaming\shadowlemon\client.yaml` |
 
-`apply config`、`replace config`、`describe config`、`import config` 等命令读写的都是上表中的文件（或被环境变量覆盖后的路径）。OpenWrt 上通常把配置放在 `/etc/shadowlemon_client_config.json` 并通过 `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` 指定。
+`apply config`、`replace config`、`describe config`、`import config` 等命令读写的都是上表中的文件（或被环境变量覆盖后的路径）。OpenWrt 上通常把配置放在 `/etc/shadowlemon_client_config.yaml` 并通过 `SHADOWLEMON_CLIENT_CONFIG_YAML_FILE` 指定。
 
 ---
 
@@ -223,17 +223,19 @@ V0.2 把配置以 JSON 格式保存，默认文件名为 `client.json` / `server
 
 | 变量 | 用途 |
 |------|------|
-| `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式服务器配置文件。V0.2 的默认路径为 `~/.config/shadowlemon/server.json`（见上文），systemd 单元通常用它指向 `/etc/shadowlemon/server.json`。 |
-| `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式客户端配置文件。OpenWrt 上通常用它指向 `/etc/shadowlemon_client_config.json`。 |
+| `SHADOWLEMON_SERVER_CONFIG_YAML_FILE` | 从该路径加载 YAML 格式服务器配置文件。V0.2 的默认路径为 `~/.config/shadowlemon/server.yaml`（见上文）。 |
+| `SHADOWLEMON_CLIENT_CONFIG_YAML_FILE` | 从该路径加载 YAML 格式客户端配置文件。OpenWrt 上通常用它指向 `/etc/shadowlemon_client_config.yaml`。 |
+| `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式服务器配置文件（兼容旧部署，不推荐）。 |
+| `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式客户端配置文件（兼容旧部署，不推荐）。 |
 | `SHADOWLEMON_PROTECT_PATH` | Android 平台上与 `VpnService.protect()` 通信的 Unix domain socket 路径（仅 `android` feature 下使用）。 |
 | `SHADOWLEMON_LOG_NO_TIMESTAMP` | 非空时关闭日志时间戳（配合 journald 等已自带时间戳的日志系统使用）。 |
 
-配置只支持 JSON 格式；从自定义路径加载时使用上表中的 `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` / `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE`。
+配置支持 YAML（推荐）与 JSON（兼容但不推荐）两种格式，按内容自动识别；从自定义路径加载时使用上表中的环境变量。通用的 `SHADOWLEMON_{CLIENT,SERVER}_CONFIG_FILE` 也接受两种格式，但会拒绝旧的 protobuf 内容。
 
 **示例：使用自定义配置文件在前台运行客户端**
 
 ```sh
-SHADOWLEMON_CLIENT_CONFIG_JSON_FILE=/etc/shadowlemon_client_config.json shadowlemon client run
+SHADOWLEMON_CLIENT_CONFIG_YAML_FILE=/etc/shadowlemon_client_config.yaml shadowlemon client run
 ```
 
 日志直接输出到终端。按 `Ctrl+C` 退出。

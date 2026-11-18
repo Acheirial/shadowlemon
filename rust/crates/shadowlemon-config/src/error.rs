@@ -28,6 +28,10 @@ pub enum ConfigError {
     #[error("invalid config JSON: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// The input was not valid YAML, or had the wrong shape for the target type.
+    #[error("invalid config YAML: {0}")]
+    Yaml(#[from] serde_yaml::Error),
+
     /// The input was not a valid URL.
     #[error("invalid URL: {0}")]
     Url(#[from] url::ParseError),

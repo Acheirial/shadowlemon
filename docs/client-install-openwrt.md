@@ -45,13 +45,13 @@ install -m 755 shadowlemon /usr/bin/shadowlemon
 
 为了能让其他设备连接至 OpenWrt 上的代理客户端，必须将 `socks5ListenLAN` 设置成 `true`。
 
-在 OpenWrt 中，请勿使用 `shadowlemon client apply config <FILE>` 和 `shadowlemon client describe config` 指令，直接把 JSON 配置保存至 `/etc/shadowlemon_client_config.json`，并通过环境变量告知客户端：
+在 OpenWrt 中，请勿使用 `shadowlemon client apply config <FILE>` 和 `shadowlemon client describe config` 指令，直接把 YAML 配置保存至 `/etc/shadowlemon_client_config.yaml`，并通过环境变量告知客户端：
 
 ```sh
-export SHADOWLEMON_CLIENT_CONFIG_JSON_FILE=/etc/shadowlemon_client_config.json
+export SHADOWLEMON_CLIENT_CONFIG_YAML_FILE=/etc/shadowlemon_client_config.yaml
 ```
 
-Rust 版本默认配置路径是 `~/.config/shadowlemon/client.json`；OpenWrt 上通常使用上面的环境变量覆盖到 `/etc/`。JSON 字段名与格式见 `rust/docs/config-v0.2.md`。
+Rust 版本默认配置路径是 `~/.config/shadowlemon/client.yaml`；OpenWrt 上通常使用上面的环境变量覆盖到 `/etc/`。字段名与格式见 `rust/docs/config-v0.2.md`。旧的 JSON 文件仍可用（通过 `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` 指定），但不推荐。
 
 另外，建议将日志等级 `loggingLevel` 设置成 `ERROR` 防止日志打满硬盘。`embedded` 构建本身也会裁掉详尽日志。
 
@@ -59,6 +59,6 @@ Rust 版本默认配置路径是 `~/.config/shadowlemon/client.json`；OpenWrt �
 
 仓库提供的 `configs/examples/etc_initd_shadowlemon`  init 脚本只调用 `shadowlemon client start` / `shadowlemon client stop`，并通过 pid 文件管理进程；Rust 版本保持同一套 CLI 子命令与 pid 文件路径语义，因此该脚本**无需修改即可继续使用**。请把该文件复制并保存为 `/etc/init.d/shadowlemon`，并赋予可执行权限。此后，shadowlemon 客户端将在 OpenWrt 开机后自行启动。
 
-init 脚本需要能读到上面设置的环境变量（可在 `/etc/init.d/shadowlemon` 中显式 `export SHADOWLEMON_CLIENT_CONFIG_JSON_FILE=/etc/shadowlemon_client_config.json`）。
+init 脚本需要能读到上面设置的环境变量（可在 `/etc/init.d/shadowlemon` 中显式 `export SHADOWLEMON_CLIENT_CONFIG_YAML_FILE=/etc/shadowlemon_client_config.yaml`）。
 
 如果需要手动启动或停止 shadowlemon 客户端，可以使用指令 `/etc/init.d/shadowlemon start` 和 `/etc/init.d/shadowlemon stop`。

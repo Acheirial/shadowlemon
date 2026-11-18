@@ -1,10 +1,12 @@
 //! Client and server configuration for ShadowLemon V0.2.
 //!
-//! This crate owns the serde schema for the JSON files under
+//! This crate owns the serde schema for the config files under
 //! `configs/examples/`, the [`Validate`] rules from `rust/docs/config-v0.2.md`
-//! §8, the JSON `apply` / `replace` / `describe` operations, and the two URL
-//! formats from §10. Field names and shapes are intentionally identical to the
-//! Go V0.1 protobuf JSON so existing configs load unchanged.
+//! §8, the YAML/JSON `apply` / `replace` / `describe` operations, and the two
+//! URL formats from §10. YAML is the recommended file format; JSON is still
+//! accepted for compatibility but prints a migration hint. Field names and
+//! shapes are intentionally identical to the Go V0.1 protobuf JSON so existing
+//! configs load unchanged.
 //!
 //! # Unknown fields
 //!
@@ -38,8 +40,10 @@ pub use enums::{
 };
 pub use error::{ConfigError, Result};
 pub use ops::{
-    apply_file, apply_json, client_config_path, config_dir, describe, describe_file, load_json,
-    merge_json, replace_file, replace_json, server_config_path, write_atomic, write_bytes_atomic,
+    apply_file, apply_file_auto, apply_json, apply_text, client_config_path, config_dir, describe,
+    describe_file, describe_file_auto, detect_format, load, load_json, merge_json, parse,
+    replace_file, replace_file_auto, replace_json, replace_text, serialize, server_config_path,
+    write_atomic, write_auto, write_bytes_atomic, ConfigFormat,
 };
 pub use schema::{
     is_valid_port, parse_port_range, Auth, ClientConfig, ClientDialer, ClientProfile, Egress,
@@ -66,25 +70,29 @@ mod tests {
         let mut count = 0;
         for entry in fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            let ext = path.extension().and_then(|e| e.to_str());
+            if !matches!(ext, Some("json" | "yaml" | "yml")) {
                 continue;
             }
             let text = fs::read_to_string(&path).unwrap();
-            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-            let object = json.as_object().unwrap();
+            let value: serde_json::Value = match detect_format(&text) {
+                ConfigFormat::Json => serde_json::from_str(&text).unwrap(),
+                ConfigFormat::Yaml => serde_yaml::from_str(&text).unwrap(),
+            };
+            let object = value.as_object().unwrap();
             if object.contains_key("profiles")
                 || object.contains_key("activeProfile")
                 || object.contains_key("socks5Port")
             {
-                let config: ClientConfig = load_json(&path).unwrap();
+                let config: ClientConfig = parse(&text).unwrap();
                 assert!(!config.profiles.is_empty(), "{}", path.display());
             } else {
-                let config: ServerConfig = load_json(&path).unwrap();
+                let config: ServerConfig = parse(&text).unwrap();
                 assert!(!config.port_bindings.is_empty(), "{}", path.display());
             }
             count += 1;
         }
-        assert!(count >= 6, "expected all example configs, found {count}");
+        assert!(count >= 8, "expected all example configs, found {count}");
     }
 
     #[test]

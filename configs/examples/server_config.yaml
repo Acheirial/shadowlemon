@@ -1,0 +1,23 @@
+# ShadowLemon 服务端配置（推荐格式：YAML）
+# 中文说明见 rust/docs/config-v0.2.md
+
+portBindings:
+  - portRange: "2012-2022"
+    protocol: UDP
+  - port: 2027
+    protocol: UDP
+
+users:
+  - name: user1
+    password: password1
+  - name: user2
+    password: password2
+    allowPrivateIP: true
+    allowLoopbackIP: true
+
+loggingLevel: INFO
+mtu: 1400
+cipherSuites:
+  - CIPHER_SUITE_XCHACHA20_POLY1305
+  - CIPHER_SUITE_AES_256_GCM
+  - CIPHER_SUITE_AES_128_GCM

@@ -60,9 +60,9 @@
 
 | 文件 | 现状 | Rust 产物建议 |
 |---|---|---|
-| `configs/examples/etc_initd_shadowlemon` | OpenWrt `/etc/rc.common` init 脚本，只调 `client start/stop`，pid 文件由程序自己维护 | 原样保留；Rust 必须由 `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` 读取配置并保持同一 pid 文件路径语义 |
+| `configs/examples/etc_initd_shadowlemon` | OpenWrt `/etc/rc.common` init 脚本，只调 `client start/stop`，pid 文件由程序自己维护 | 已改用 `SHADOWLEMON_CLIENT_CONFIG_YAML_FILE` 指向 `/etc/shadowlemon_client_config.yaml`；Rust 必须保持同一 pid 文件路径语义 |
 | `configs/examples/shadowlemon-{client,server}.service` | systemd `Type=exec`，`ExecStart=... client run` / `server run` | 原样保留；`run` 子命令必须在前台运行并把日志写到 stdout（systemd 交给 journal） |
-| `docs/client-install-openwrt.md` | 要求 `socks5ListenLAN=true`、直接写 `/etc/shadowlemon_client_config.json`、`loggingLevel=ERROR`、用 init 脚本管理 | 增加 Rust 章节：musl 静态二进制、`embedded` feature、体积数字、MIPS 构建说明 |
+| `docs/client-install-openwrt.md` | 要求 `socks5ListenLAN=true`、直接写 `/etc/shadowlemon_client_config.yaml`、`loggingLevel=ERROR`、用 init 脚本管理 | 增加 Rust 章节：musl 静态二进制、`embedded` feature、体积数字、MIPS 构建说明 |
 | `docs/compile.md` | `make` 构建单一二进制；交叉编译示例含 `GOARCH=mips CGO_ENABLED=0` | 改为 `cargo build --release --target ...` 与 `make` 封装；补充本文件第 4、5 节 |
 | `docs/operation.md` | 记录各 OS 配置/日志目录、环境变量 | Rust 用 `dirs`/`directories` crate 复现：`$XDG_CACHE_HOME`/`$HOME/.cache`、`~/Library/Caches`、Windows `%LOCALAPPDATA%`；配置 dirs 同理 |
 | `Makefile` / `CGO_ENABLED=0` / `-trimpath -ldflags="-s -w"` | Go 的纯静态、去符号构建 | 对应 Rust：`+crt-static`、`strip="symbols"`、`panic="abort"`、`lto`、`codegen-units=1`；见第 5 节 |

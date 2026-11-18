@@ -37,13 +37,13 @@ sudo install -m 755 rust/target/release/shadowlemon /usr/local/bin/shadowlemon
 | 项目 | 路径 |
 | :-- | :-- |
 | 编译产物 | `rust/target/release/shadowlemon`（显式指定目标三元组时位于 `rust/target/<target>/release/shadowlemon`；在仓库根目录运行 `make` 会另存一份为 `bin/shadowlemon`） |
-| 默认服务端配置 | `$XDG_CONFIG_HOME/shadowlemon/server.json`，未设置 `XDG_CONFIG_HOME` 时为 `~/.config/shadowlemon/server.json`（JSON） |
-| 环境变量覆盖 | `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` |
+| 默认服务端配置 | `$XDG_CONFIG_HOME/shadowlemon/server.yaml`，未设置 `XDG_CONFIG_HOME` 时为 `~/.config/shadowlemon/server.yaml`（YAML，推荐） |
+| 环境变量覆盖 | `SHADOWLEMON_SERVER_CONFIG_YAML_FILE`；`SHADOWLEMON_SERVER_CONFIG_JSON_FILE` 用于旧的 JSON 文件 |
 
-JSON 字段名与格式见 `rust/docs/config-v0.2.md`。使用 systemd 时通常通过环境变量把配置指向 `/etc/shadowlemon/server.json`：
+字段名与格式见 `rust/docs/config-v0.2.md`。两种格式字段名相同；若同目录已有旧的 `server.json`，会继续使用它并提示迁移。使用 systemd 时通常通过环境变量把配置指向 `/etc/shadowlemon/server.yaml`：
 
 ```ini
-Environment=SHADOWLEMON_SERVER_CONFIG_JSON_FILE=/etc/shadowlemon/server.json
+Environment=SHADOWLEMON_SERVER_CONFIG_YAML_FILE=/etc/shadowlemon/server.yaml
 ExecStart=/usr/bin/shadowlemon server run
 ```
 
@@ -118,7 +118,7 @@ shadowlemon server replace config <FILE>
 
 如果你想把代理线路分享给别人使用，也可以创建多个不同的用户。
 
-假设在服务器上，这个配置文件的文件名是 `server_config.json`，在文件修改完成之后，请调用指令 `shadowlemon server apply config server_config.json` 写入该配置。
+假设在服务器上，这个配置文件的文件名是 `server_config.yaml`，在文件修改完成之后，请调用指令 `shadowlemon server apply config server_config.yaml` 写入该配置。
 
 如果配置有误，`shadowlemon server` 会打印出现的问题。请根据提示修改配置文件，重新运行 `shadowlemon server apply config <FILE>` 指令写入修正后的配置。
 

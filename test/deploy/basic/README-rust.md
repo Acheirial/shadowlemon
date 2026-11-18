@@ -93,5 +93,5 @@ TEST_BINARY=./shadowlemon ./test_tcp.sh
   - `UDP handshake timed out` / `UDP stream handshake response timed out` —— 握手响应超时（数据面 I/O 会以超时/失败告终）。
   - 另有 `ShadowLemon V0.2 cipher suite configuration loaded` 由 `rust/crates/shadowlemon-app/src/runtime.rs` 打印。
 - `libtest.sh` 中的 `run_socks5_test <TCP|UDP>` 标签仅为历史场景名：`TCP` 表示 SOCKS5 CONNECT（TCP 目标走 UDP 隧道可靠层），`UDP` 表示 UDP associate；两者都使用 UDP 绑定，不选择外部传输。
-- 客户端默认配置文件名是 `client.json`，服务端是 `server.json`；可用 `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` / `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` 覆盖。
+- 客户端默认配置文件名是 `client.yaml`，服务端是 `server.yaml`；可用 `SHADOWLEMON_CLIENT_CONFIG_YAML_FILE` / `SHADOWLEMON_SERVER_CONFIG_YAML_FILE` 覆盖。JSON 仍可用但不推荐；集成测试中的 `*.json` 配置用于验证向后兼容。
 - 线协议版本字节为 `4`，两端必须一致。
