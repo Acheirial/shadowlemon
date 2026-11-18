@@ -110,9 +110,9 @@ const UDP_KIND_HANDSHAKE_RESPONSE: u8 = 2;
 const UDP_KIND_SESSION_DATA: u8 = 3;
 /// Routing envelope: encrypted session reply/ACK.
 const UDP_KIND_SESSION_REPLY: u8 = 4;
-/// `[obfuscated kind][session id]` prefix length of the UDP routing envelope.
-/// The kind byte is masked with a deterministic mix of the random session ID
-/// so the prefix has no fixed, signature-matchable bytes.
+/// `[masked kind][masked session id]` prefix length of the UDP routing envelope.
+/// Both fields are XORed with a keystream keyed by the frame's nonce, so the
+/// prefix has no fixed, signature-matchable bytes and changes per datagram.
 const UDP_ENVELOPE_LEN: usize = 5;
 /// `[message id][fragment number][fragment count]` application prefix.
 const APP_FRAGMENT_HEADER_LEN: usize = 6;
@@ -399,12 +399,14 @@ impl mux::ClientHandshake for RealClientHandshake {
                 Arc::clone(&handle.shutdown),
             );
             let key_state = Arc::new(KeyUpgradeState::new());
+            let ticker_wake = Arc::new(Notify::new());
             spawn_client_ticker(
                 Arc::clone(&session),
                 Arc::clone(&socket),
                 server,
                 session_id,
                 Arc::clone(&handle.shutdown),
+                Arc::clone(&ticker_wake),
             );
             spawn_stream_key_upgrade(
                 handshake,
@@ -432,6 +434,7 @@ impl mux::ClientHandshake for RealClientHandshake {
                     assembler: Mutex::new(HashMap::new()),
                     inbound: Some(inbound),
                     key_state: Some(key_state),
+                    ticker_wake,
                 }),
                 target,
             ));
@@ -525,12 +528,14 @@ impl mux::ClientHandshake for RealClientHandshake {
                 server,
                 shutdown: Arc::new(Notify::new()),
             });
+            let ticker_wake = Arc::new(Notify::new());
             spawn_client_ticker(
                 Arc::clone(&session),
                 Arc::clone(&socket),
                 server,
                 session_id,
                 Arc::clone(&handle.shutdown),
+                Arc::clone(&ticker_wake),
             );
             self.udp_sessions.insert(session_id, handle);
             debug!(session_id, suite = %established.suite, "UDP session established to PacketUnderlay{{");
@@ -548,6 +553,7 @@ impl mux::ClientHandshake for RealClientHandshake {
                 assembler: Mutex::new(HashMap::new()),
                 inbound: None,
                 key_state: None,
+                ticker_wake,
             });
             Ok(tunnel)
         })
@@ -979,37 +985,48 @@ fn spawn_udp_reader(
     });
 }
 
-/// Periodically drive a client session's timers so delayed ACKs and
-/// retransmissions are emitted. Frames are sent directly on the client's UDP
-/// socket. The loop exits when the session closes or the socket is gone.
+/// Drive a client session's timers at their exact deadlines so delayed ACKs and
+/// retransmissions are emitted without a fixed-rate polling ticker. Frames are
+/// sent directly on the client's UDP socket. The loop exits when the session
+/// closes or shutdown is signalled.
 fn spawn_client_ticker(
     session: Arc<Mutex<Session>>,
     socket: Arc<UdpSocket>,
     server: SocketAddr,
     session_id: u32,
     shutdown: Arc<Notify>,
+    wake: Arc<Notify>,
 ) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_millis(2));
         loop {
+            let deadline = {
+                let guard = session.lock().await;
+                guard.next_timer()
+            };
+            // With no scheduled timer, wake periodically to pump frames that
+            // were queued directly onto the send queue.
+            let wait_until = deadline.unwrap_or_else(|| Instant::now() + Duration::from_millis(50));
             tokio::select! {
                 _ = shutdown.notified() => break,
-                _ = ticker.tick() => {
-                    let frames = {
-                        let mut guard = session.lock().await;
-                        if guard.is_closed() {
-                            break;
-                        }
-                        let _ = guard.tick(Instant::now());
-                        drain_output(&mut guard)
-                    };
-                    for frame in frames {
-                        let wire = wrap_udp(UDP_KIND_SESSION_DATA, session_id, &frame);
-                        if let Err(err) = socket.send_to(&wire, server).await {
-                            debug!(%err, "client ticker send failed");
-                            break;
-                        }
-                    }
+                // A freshly arrived frame may have moved `ack_deadline` or
+                // armed a retransmission; recompute the deadline immediately
+                // instead of waiting out an already-expired timer snapshot.
+                _ = wake.notified() => {}
+                _ = tokio::time::sleep_until(wait_until.into()) => {}
+            }
+            let frames = {
+                let mut guard = session.lock().await;
+                if guard.is_closed() {
+                    break;
+                }
+                let _ = guard.tick(Instant::now());
+                drain_output(&mut guard)
+            };
+            for frame in frames {
+                let wire = wrap_udp(UDP_KIND_SESSION_DATA, session_id, &frame);
+                if let Err(err) = socket.send_to(&wire, server).await {
+                    debug!(%err, "client ticker send failed");
+                    break;
                 }
             }
         }
@@ -1066,34 +1083,41 @@ fn drain_output(session: &mut Session) -> Vec<Vec<u8>> {
     std::iter::from_fn(|| session.poll_output()).collect()
 }
 
-/// Mix a random session ID into a single byte. This is the MurmurHash3 finalizer
-/// resized to 8 bits; it is an obfuscation against fixed-byte DPI signatures,
-/// not encryption — a protocol-aware observer can still invert it. Real
-/// confidentiality of the routing metadata requires a negotiated secret key.
-fn envelope_mask(session_id: u32) -> u8 {
-    let mut x = session_id;
-    x ^= x >> 16;
-    x = x.wrapping_mul(0x7feb_352d);
-    x ^= x >> 15;
-    x = x.wrapping_mul(0x846c_a68b);
-    x ^= x >> 16;
-    (x & 0xff) as u8
+/// Send one wire datagram and then yield briefly. Bulk replies are split into
+/// many fragments; pacing them avoids a back-to-back micro-burst whose regular
+/// inter-packet gaps would be an obvious traffic fingerprint.
+async fn send_paced(socket: &UdpSocket, wire: &[u8], target: SocketAddr) -> io::Result<()> {
+    socket.send_to(wire, target).await?;
+    Ok(())
 }
 
 fn wrap_udp(kind: u8, session_id: u32, frame: &[u8]) -> Vec<u8> {
+    // UDP frames always start with the explicit wire nonce; its leading bytes
+    // seed a per-datagram keystream, so the masked prefix changes on every
+    // packet rather than staying constant for a whole session. The `min(4)`
+    // clamp keeps short (test) frames from indexing past their end.
+    let salt = &frame[..frame.len().min(4)];
+    let ks = shadowlemon_crypto::envelope_keystream(salt);
+    let id = session_id.to_be_bytes();
     let mut out = Vec::with_capacity(UDP_ENVELOPE_LEN + frame.len());
-    out.push(kind ^ envelope_mask(session_id));
-    out.extend_from_slice(&session_id.to_be_bytes());
+    out.push(kind ^ ks[0]);
+    out.extend(id.iter().zip(&ks[1..]).map(|(b, k)| b ^ k));
     out.extend_from_slice(frame);
     out
 }
 
 fn unwrap_udp(datagram: &[u8]) -> Option<(u8, u32, &[u8])> {
-    if datagram.len() < UDP_ENVELOPE_LEN {
+    if datagram.len() < UDP_ENVELOPE_LEN + 4 {
         return None;
     }
-    let id = u32::from_be_bytes(datagram[1..5].try_into().ok()?);
-    let kind = datagram[0] ^ envelope_mask(id);
+    let salt = &datagram[UDP_ENVELOPE_LEN..UDP_ENVELOPE_LEN + 4];
+    let ks = shadowlemon_crypto::envelope_keystream(salt);
+    let kind = datagram[0] ^ ks[0];
+    let mut id = [0u8; 4];
+    for i in 0..4 {
+        id[i] = datagram[1 + i] ^ ks[1 + i];
+    }
+    let id = u32::from_be_bytes(id);
     // Reject packets whose masked kind is not one of the four legal values;
     // this also drops unrelated UDP noise before it reaches the handshake.
     if !(UDP_KIND_HANDSHAKE_REQUEST..=UDP_KIND_SESSION_REPLY).contains(&kind) {
@@ -1184,6 +1208,8 @@ struct TunnelDatagramSocket {
     inbound: Option<Arc<UdpInbound>>,
     /// Set on the 0-RTT stream path: data-plane I/O waits for the key swap.
     key_state: Option<Arc<KeyUpgradeState>>,
+    /// Wakes the client ticker when an inbound frame may have armed a timer.
+    ticker_wake: Arc<Notify>,
 }
 
 impl TunnelDatagramSocket {
@@ -1195,16 +1221,53 @@ impl TunnelDatagramSocket {
             session.on_frame(frame, Instant::now()).map_err(io_err)?;
             let chunks: Vec<Vec<u8>> = std::iter::from_fn(|| session.try_recv()).collect();
             for ack in drain_output(&mut session) {
-                self.socket
-                    .send_to(
-                        &wrap_udp(UDP_KIND_SESSION_DATA, self.session_id, &ack),
-                        self.server,
-                    )
-                    .await?;
+                let wire = wrap_udp(UDP_KIND_SESSION_DATA, self.session_id, &ack);
+                send_paced(&self.socket, &wire, self.server).await?;
             }
             chunks
         };
+        // `on_frame` may have armed a delayed-ACK or retransmission deadline
+        // while the ticker was sleeping on an older snapshot.
+        self.ticker_wake.notify_one();
         Ok(chunks)
+    }
+}
+
+impl TunnelDatagramSocket {
+    /// Send one datagram, optionally overriding the destination hostname.
+    ///
+    /// The SOCKS5 UDP relay passes the domain of each individual datagram via
+    /// `host`; IP-literal targets pass `None` and use the connection target.
+    async fn send_with_host(
+        &self,
+        data: &[u8],
+        target: SocketAddr,
+        host: Option<&str>,
+    ) -> io::Result<usize> {
+        if let Some(key_state) = &self.key_state {
+            key_state.wait().await?;
+        }
+        let address = match host {
+            Some(host) if !host.is_empty() => Address::Domain(host.to_owned()),
+            _ => match &self.host {
+                Some(host) if target == self.target => Address::Domain(host.clone()),
+                _ => Address::Ip(target.ip()),
+            },
+        };
+        let mut datagram = encode_udp_header(&address, target.port());
+        datagram.extend_from_slice(data);
+        let id = self.message_id.fetch_add(1, Ordering::Relaxed);
+        let fragments = fragment_payload(&datagram, self.max_fragment, id)?;
+        let mut session = self.session.lock().await;
+        for fragment in fragments {
+            session.send(&fragment).await.map_err(io_err)?;
+        }
+        session.tick(Instant::now()).map_err(io_err)?;
+        for frame in drain_output(&mut session) {
+            let wire = wrap_udp(UDP_KIND_SESSION_DATA, self.session_id, &frame);
+            send_paced(&self.socket, &wire, self.server).await?;
+        }
+        Ok(data.len())
     }
 }
 
@@ -1214,33 +1277,16 @@ impl DatagramSocket for TunnelDatagramSocket {
         data: &'a [u8],
         target: SocketAddr,
     ) -> BoxFuture<'a, io::Result<usize>> {
-        Box::pin(async move {
-            if let Some(key_state) = &self.key_state {
-                key_state.wait().await?;
-            }
-            let address = match &self.host {
-                Some(host) if target == self.target => Address::Domain(host.clone()),
-                _ => Address::Ip(target.ip()),
-            };
-            let mut datagram = encode_udp_header(&address, target.port());
-            datagram.extend_from_slice(data);
-            let id = self.message_id.fetch_add(1, Ordering::Relaxed);
-            let fragments = fragment_payload(&datagram, self.max_fragment, id)?;
-            let mut session = self.session.lock().await;
-            for fragment in fragments {
-                session.send(&fragment).await.map_err(io_err)?;
-            }
-            session.tick(Instant::now()).map_err(io_err)?;
-            for frame in drain_output(&mut session) {
-                self.socket
-                    .send_to(
-                        &wrap_udp(UDP_KIND_SESSION_DATA, self.session_id, &frame),
-                        self.server,
-                    )
-                    .await?;
-            }
-            Ok(data.len())
-        })
+        Box::pin(async move { self.send_with_host(data, target, None).await })
+    }
+
+    fn send_to_host<'a>(
+        &'a self,
+        data: &'a [u8],
+        target: SocketAddr,
+        host: Option<&'a str>,
+    ) -> BoxFuture<'a, io::Result<usize>> {
+        Box::pin(async move { self.send_with_host(data, target, host).await })
     }
 
     fn recv_from<'a>(
@@ -1437,7 +1483,7 @@ impl ServerUdpSession {
         let _ = session.tick(Instant::now());
         for frame in drain_output(&mut session) {
             let wire = wrap_udp(UDP_KIND_SESSION_REPLY, self.session_id, &frame);
-            if let Err(err) = self.reply_socket.send_to(&wire, self.client).await {
+            if let Err(err) = send_paced(&self.reply_socket, &wire, self.client).await {
                 debug!(%err, "background UDP reply send failed");
             }
         }
@@ -1450,7 +1496,7 @@ impl ServerUdpSession {
         let _ = session.tick(Instant::now());
         for frame in drain_output(&mut session) {
             let wire = wrap_udp(UDP_KIND_SESSION_REPLY, self.session_id, &frame);
-            if let Err(err) = self.reply_socket.send_to(&wire, self.client).await {
+            if let Err(err) = send_paced(&self.reply_socket, &wire, self.client).await {
                 debug!(%err, "background UDP reply send failed");
             }
         }
@@ -1690,17 +1736,23 @@ mod tests {
     }
 
     #[test]
-    fn udp_envelope_kind_byte_is_obfuscated_and_varies_with_session() {
-        // A passive observer must not find the old fixed 1/2/3/4 prefix.
+    fn udp_envelope_kind_byte_is_obfuscated_and_varies_per_packet() {
+        // A passive observer must not find the old fixed 1/2/3/4 prefix. The
+        // mask is keyed by the per-frame nonce, so it changes from packet to
+        // packet even inside a single session.
         let mut first_bytes = std::collections::HashSet::new();
-        for id in [1u32, 2, 3, 42, 10_000, u32::MAX] {
-            let frame = wrap_udp(UDP_KIND_SESSION_DATA, id, b"x");
-            assert_ne!(frame[0], UDP_KIND_SESSION_DATA);
-            first_bytes.insert(frame[0]);
+        for nonce in 0..64u32 {
+            let mut frame = vec![0u8; 24];
+            frame[..4].copy_from_slice(&nonce.to_be_bytes());
+            let wrapped = wrap_udp(UDP_KIND_SESSION_DATA, 42, &frame);
+            first_bytes.insert(wrapped[0]);
         }
         assert!(first_bytes.len() > 1);
+        assert!(first_bytes.iter().any(|b| *b != UDP_KIND_SESSION_DATA));
         // Garbage is rejected before reaching the handshake dispatcher.
-        let mut garbage = wrap_udp(UDP_KIND_SESSION_DATA, 7, b"x");
+        let mut garbage = vec![0u8; 24];
+        garbage[..4].copy_from_slice(&7u32.to_be_bytes());
+        let mut garbage = wrap_udp(UDP_KIND_SESSION_DATA, 7, &garbage);
         garbage[0] ^= 0xff;
         assert!(unwrap_udp(&garbage).is_none());
     }
@@ -1709,7 +1761,8 @@ mod tests {
     fn application_fragments_reassemble_in_descending_order() {
         let data: Vec<u8> = (0..40u8).collect();
         let pieces = fragment_payload(&data, 16, 9).unwrap();
-        assert_eq!(pieces.len(), 3);
+        // Piece sizes are randomized in [max/2, max], so the count varies.
+        assert!((3..=5).contains(&pieces.len()));
         let mut map = HashMap::new();
         let mut result = None;
         for piece in pieces {

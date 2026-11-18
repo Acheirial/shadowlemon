@@ -2,8 +2,9 @@
 //!
 //! The handshake protects exactly two messages with a static key derived from
 //! the user credential: the `openSessionRequest` payload (a 51 + suite_count
-//! byte prefix, optionally followed by piggybacked application data) and the
-//! `openSessionResponse` payload (a fixed 51 bytes). Once both peers know the
+//! byte prefix, then a two-byte length-prefixed piggyback region padded with
+//! random bytes to the session payload capacity) and the `openSessionResponse`
+//! payload (a fixed 51 bytes). Once both peers know the
 //! server's ephemeral key and salt, all data-plane keys come from a fresh
 //! X25519 exchange. The ephemeral private key is zeroized as soon as the
 //! directional session keys have been derived.
@@ -468,9 +469,13 @@ impl ClientHandshake {
 
     /// Build and encrypt the `openSessionRequest` frame.
     ///
-    /// At most [`Self::piggyback_capacity`] bytes of `piggyback` are attached;
-    /// the caller must queue the remainder for the data plane. Repeated calls
-    /// are rejected: a handshake emits exactly one request.
+    /// At most [`Self::piggyback_capacity`] minus two bytes of `piggyback` are
+    /// attached. A two-byte little-endian length prefix lets the server strip
+    /// the random bytes that pad the rest of the region to full capacity, so
+    /// the ciphertext length no longer reveals the SOCKS5 command / address
+    /// type / domain length. The caller must queue the remainder for the data
+    /// plane. Repeated calls are rejected: a handshake emits exactly one
+    /// request.
     pub fn build_request(&mut self, piggyback: &[u8]) -> Result<Vec<u8>, HandshakeError> {
         self.check_timeout(Instant::now())?;
         if self.state != ClientHandshakeState::Ready {
@@ -488,9 +493,22 @@ impl ClientHandshake {
             client_salt,
         };
         request.validate()?;
-        let mut payload = request.marshal();
-        let attached = piggyback.len().min(self.piggyback_capacity());
+        let request_bytes = request.marshal();
+        let capacity = self.piggyback_capacity();
+        // Two bytes are reserved for the length prefix; the rest of the region
+        // is filled with random bytes so every request has the same encrypted
+        // length regardless of the piggyback's real size.
+        let usable = capacity.saturating_sub(2);
+        let attached = piggyback.len().min(usable);
+        let attached_len = u16::try_from(attached).expect("piggyback fits capacity");
+        let mut payload = Vec::with_capacity(request_bytes.len() + capacity);
+        payload.extend_from_slice(&request_bytes);
+        payload.extend_from_slice(&attached_len.to_le_bytes());
         payload.extend_from_slice(&piggyback[..attached]);
+        payload.resize(request_bytes.len() + capacity, 0);
+        if attached < usable {
+            rand::rng().fill_bytes(&mut payload[request_bytes.len() + 2 + attached..]);
+        }
 
         // A random-length suffix breaks the fixed 140/150-byte handshake frame
         // fingerprint. The server reads the variable part from the decrypted
@@ -823,7 +841,24 @@ impl ServerHandshake {
         }
         let (request, consumed) = HandshakeRequest::parse(&payload)?;
         auth.record(&self.registry);
-        let piggyback = payload[consumed..].to_vec();
+        // The client pads the piggyback region to full capacity and prepends a
+        // two-byte little-endian length prefix. Strip both so downstream code
+        // still sees exactly the application data the client attached.
+        let region = &payload[consumed..];
+        if region.len() < 2 {
+            self.state = ServerHandshakeState::Rejected;
+            return Err(HandshakeError::Malformed(
+                "handshake request is missing the piggyback length prefix".to_owned(),
+            ));
+        }
+        let piggyback_len = usize::from(u16::from_le_bytes([region[0], region[1]]));
+        let Some(padded) = region.get(2..2 + piggyback_len) else {
+            self.state = ServerHandshakeState::Rejected;
+            return Err(HandshakeError::Malformed(
+                "piggyback length exceeds the padded region".to_owned(),
+            ));
+        };
+        let piggyback = padded.to_vec();
 
         let suite = match negotiate_suite(&request.suites, &self.allowed_suites) {
             Some(suite) => suite,
@@ -907,7 +942,7 @@ pub fn negotiate_suite(client: &[Suite], server_order: &[Suite]) -> Option<Suite
     preferred.into_iter().find(|suite| client.contains(suite))
 }
 
-/// Encrypt a fixed 51-byte response with the envelope key.
+/// Encrypt a 51-byte response with a random-length suffix with the envelope key.
 fn encode_response(
     envelope: &AeadCipher,
     response: &HandshakeResponse,
@@ -917,14 +952,23 @@ fn encode_response(
 ) -> Result<Vec<u8>, HandshakeError> {
     let payload = response.marshal();
     debug_assert_eq!(payload.len(), HANDSHAKE_RESPONSE_LEN);
+    // A random-length suffix breaks the fixed-size response frame fingerprint.
+    // The client decodes the variable part from the metadata suffix length.
+    let suffix: Vec<u8> = if MAX_SUFFIX_PADDING == 0 {
+        Vec::new()
+    } else {
+        let len = rand::random_range(0..=MAX_SUFFIX_PADDING);
+        (0..len).map(|_| rand::random::<u8>()).collect()
+    };
     let metadata = Metadata::session(
         TYPE_OPEN_SESSION_RESPONSE,
         session_id,
         0,
         payload_len(&payload)?,
-        0,
+        u8::try_from(suffix.len()).expect("suffix padding <= 32"),
     );
-    let segment = shadowlemon_wire::Segment::new(metadata, nonce, payload.to_vec());
+    let mut segment = shadowlemon_wire::Segment::new(metadata, nonce, payload.to_vec());
+    segment.suffix_padding = suffix;
     let options = EncodeOptions {
         include_nonce: transport == HandshakeTransport::Datagram,
         payload_nonce: transport.payload_nonce(),
@@ -1134,17 +1178,19 @@ mod tests {
         .unwrap();
 
         let request = client.build_request(b"").unwrap();
-        let base = WIRE_NONCE_LEN + META_BLOCK_LEN + 51 + 1 /* suite */ + AEAD_TAG_LEN;
+        // The piggyback region is always padded to the full session payload, so
+        // only the random suffix changes the overall frame length.
+        let base =
+            WIRE_NONCE_LEN + META_BLOCK_LEN + shadowlemon_wire::MAX_SESSION_PAYLOAD + AEAD_TAG_LEN;
         assert!((base..=base + MAX_SUFFIX_PADDING).contains(&request.len()));
         let response = match server.accept(&request).unwrap() {
             ServerHandshakeResult::Established { response, .. } => response,
             _ => panic!("unexpected result"),
         };
-        // In datagram mode every message carries its own explicit nonce.
-        assert_eq!(
-            response.len(),
-            WIRE_NONCE_LEN + META_BLOCK_LEN + HANDSHAKE_RESPONSE_LEN + AEAD_TAG_LEN
-        );
+        // In datagram mode every message carries its own explicit nonce. The
+        // response has a random-length suffix, so its length varies.
+        let base = WIRE_NONCE_LEN + META_BLOCK_LEN + HANDSHAKE_RESPONSE_LEN + AEAD_TAG_LEN;
+        assert!((base..=base + MAX_SUFFIX_PADDING).contains(&response.len()));
         assert!(matches!(
             client.process_response(&response),
             Ok(ClientOutcome::Established(_))

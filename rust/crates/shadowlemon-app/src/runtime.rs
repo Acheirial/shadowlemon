@@ -17,8 +17,8 @@ use shadowlemon_protocol::{
     RealClientHandshake, RealServerHandshake,
 };
 use shadowlemon_socks5::{
-    encode_request, Address, AsyncIo, Credential, DatagramSocket, ProxyDialer, Server, ATYP_DOMAIN,
-    ATYP_IPV4, ATYP_IPV6, CMD_CONNECT, VERSION,
+    encode_request, Address, AsyncIo, Credential, DatagramSocket, PassThroughResolver, ProxyDialer,
+    Server, ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, CMD_CONNECT, VERSION,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -80,8 +80,13 @@ pub async fn run_client(path: PathBuf, stop: &'static AtomicI32) -> Result<(), A
             .await;
     }
 
+    // Never resolve SOCKS5 target domains locally: that would leak them through
+    // the client's DNS. The tunnel carries Address::Domain to the server, which
+    // performs the real lookup at its egress; this resolver only supplies a
+    // harmless placeholder IP for local bookkeeping.
     let mut socks_config = shadowlemon_socks5::Config::new(Arc::new(mux.clone()))
-        .with_credentials(socks_credentials(&config));
+        .with_credentials(socks_credentials(&config))
+        .with_resolver(Arc::new(PassThroughResolver));
     if matches!(
         profile.handshake_mode,
         Some(shadowlemon_config::HandshakeMode::HandshakeNoWait)

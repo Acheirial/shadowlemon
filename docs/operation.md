@@ -227,6 +227,7 @@ V0.2 推荐用 YAML 格式保存配置，默认文件名为 `client.yaml` / `ser
 | `SHADOWLEMON_CLIENT_CONFIG_YAML_FILE` | 从该路径加载 YAML 格式客户端配置文件。OpenWrt 上通常用它指向 `/etc/shadowlemon_client_config.yaml`。 |
 | `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式服务器配置文件（兼容旧部署，不推荐）。 |
 | `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式客户端配置文件（兼容旧部署，不推荐）。 |
+| `SHADOWLEMON_ENVELOPE_SECRET` | 部署秘密：用于加密 UDP 路由信封与派生用户 hint。客户端与服务端必须设置**相同**的值，否则无法通信。未设置时回退到内置默认值（兼容旧部署，但不建议用于对抗指纹）。 |
 | `SHADOWLEMON_PROTECT_PATH` | Android 平台上与 `VpnService.protect()` 通信的 Unix domain socket 路径（仅 `android` feature 下使用）。 |
 | `SHADOWLEMON_LOG_NO_TIMESTAMP` | 非空时关闭日志时间戳（配合 journald 等已自带时间戳的日志系统使用）。 |
 

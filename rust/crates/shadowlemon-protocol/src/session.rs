@@ -53,14 +53,14 @@ pub const SEGMENT_CHAN_CAPACITY: usize = 256;
 pub const MAX_UNREAD_SEGMENTS: usize = 512;
 /// Delayed ACK window for packet transport.
 pub const PACKET_ACK_DELAY: Duration = Duration::from_millis(1);
-/// Base heartbeat interval.
-pub const SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-/// Uniform base jitter, in milliseconds (`[-1000, +1000]`).
-pub const SESSION_HEARTBEAT_JITTER_MS: i64 = 1000;
-/// Probability denominator of the long-tail heartbeat jitter (one in eight).
-pub const SESSION_HEARTBEAT_LONG_TAIL_DIVISOR: i32 = 8;
-/// Long-tail jitter range, in milliseconds (`[1, 8000]`).
-pub const SESSION_HEARTBEAT_LONG_TAIL_MS: i64 = 8000;
+/// Lower bound of the uniformly distributed heartbeat interval.
+pub const HEARTBEAT_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// Upper bound of the uniformly distributed heartbeat interval. Kept well
+/// below the 30s NAT timeout so idle mappings stay alive.
+pub const HEARTBEAT_MAX_INTERVAL: Duration = Duration::from_secs(15);
+/// Maximum random padding on ACK frames. Metadata stores the padding length in
+/// a `u8`, so 255 is the largest value the wire format can express.
+const ACK_PADDING_MAX: usize = 255;
 /// ACKs of this many consecutive segments trigger a proactive window update.
 pub const ACK_WINDOW_UPDATE_THRESHOLD: u32 = 2048;
 /// Duplicate ACKs that trigger early retransmission.
@@ -305,8 +305,12 @@ impl Chain {
 
 #[derive(Clone, Debug)]
 struct SentSegment {
-    /// Complete wire frame, reused verbatim on retransmission.
-    frame: Vec<u8>,
+    /// Plaintext fragment, re-encrypted with a fresh nonce and fresh padding
+    /// on every retransmission so retries are not byte-identical to the first
+    /// send (the sequence number is kept, however, so the peer can dedupe).
+    payload: Vec<u8>,
+    /// Fragment index of `payload` within the application message.
+    fragment: u8,
     /// Number of transmissions so far (1 for the first send).
     tx_count: u32,
     /// Consecutive duplicate ACKs seen for this segment.
@@ -556,7 +560,8 @@ impl Session {
             self.send_buf.insert(
                 seq,
                 SentSegment {
-                    frame: frame.clone(),
+                    payload,
+                    fragment,
                     tx_count: 1,
                     ack_count: 0,
                     tx_time: now,
@@ -610,28 +615,49 @@ impl Session {
             self.encode_ack()?;
         }
 
+        // Collect the segments to retry first. `encode_data_at` needs `&mut
+        // self`, which cannot overlap with an active `send_buf` iterator.
         let mut loss = false;
         let mut timeout = false;
-        for segment in self.send_buf.values_mut() {
+        let mut over_limit = false;
+        let mut to_retransmit = Vec::new();
+        for (&seq, segment) in &self.send_buf {
             let early = segment.ack_count >= EARLY_RETRANSMISSION
                 && segment.tx_count <= EARLY_RETRANSMISSION_LIMIT;
             let timed_out = now.saturating_duration_since(segment.tx_time) >= segment.tx_timeout;
             if early || timed_out {
                 if segment.tx_count >= TX_COUNT_LIMIT {
-                    self.close(false)?;
-                    return Err(SessionError::TooManyRetransmissions);
+                    over_limit = true;
+                    break;
                 }
-                segment.tx_count += 1;
-                segment.ack_count = 0;
-                segment.tx_time = now;
-                segment.tx_timeout = retransmission_timeout(self.rtt.rto(), segment.tx_count);
-                self.outgoing.push_back(segment.frame.clone());
                 if early {
                     loss = true;
                 } else {
                     timeout = true;
                 }
+                to_retransmit.push(seq);
             }
+        }
+        if over_limit {
+            self.close(false)?;
+            return Err(SessionError::TooManyRetransmissions);
+        }
+        for seq in to_retransmit {
+            let (payload, fragment) = {
+                let segment = self
+                    .send_buf
+                    .get_mut(&seq)
+                    .expect("retransmission target still in flight");
+                segment.tx_count += 1;
+                segment.ack_count = 0;
+                segment.tx_time = now;
+                segment.tx_timeout = retransmission_timeout(self.rtt.rto(), segment.tx_count);
+                (segment.payload.clone(), segment.fragment)
+            };
+            // Same sequence number for peer-side deduplication, but a fresh
+            // nonce and padding so the retry is not a byte-for-byte copy.
+            let frame = self.encode_data_at(seq, &payload, fragment)?;
+            self.outgoing.push_back(frame);
         }
         // Early retransmission and timeout feed CUBIC mutually exclusively.
         if loss {
@@ -925,6 +951,20 @@ impl Session {
     fn encode_data(&mut self, payload: &[u8], fragment: u8) -> Result<Vec<u8>, SessionError> {
         let seq = self.next_send;
         self.next_send = self.next_send.wrapping_add(1);
+        self.encode_data_at(seq, payload, fragment)
+    }
+
+    /// Encode one data frame with an explicit sequence number.
+    ///
+    /// Retransmissions pass the original sequence number so the peer can still
+    /// deduplicate by seq, while fresh padding and a fresh nonce keep the wire
+    /// bytes different on every transmission.
+    fn encode_data_at(
+        &mut self,
+        seq: u32,
+        payload: &[u8],
+        fragment: u8,
+    ) -> Result<Vec<u8>, SessionError> {
         let prefix = Self::random_padding(MAX_PREFIX_PADDING);
         let suffix = Self::random_padding(MAX_SUFFIX_PADDING);
         let metadata = shadowlemon_wire::Metadata::data(
@@ -945,8 +985,11 @@ impl Session {
 
     fn encode_ack(&mut self) -> Result<(), SessionError> {
         let seq = self.next_send.wrapping_sub(1);
-        let prefix = Self::random_padding(MAX_PREFIX_PADDING);
-        let suffix = Self::random_padding(MAX_SUFFIX_PADDING);
+        // Widen the ACK envelope: a 0..32 padding cap made every ACK land in a
+        // narrow 77..141 byte band. Using the full u8 range spreads ACKs over
+        // 77..587 bytes at the cost of a few hundred extra bytes per ACK.
+        let prefix = Self::random_padding(ACK_PADDING_MAX);
+        let suffix = Self::random_padding(ACK_PADDING_MAX);
         let metadata = shadowlemon_wire::Metadata::data(
             self.direction.ack_type(),
             self.id,
@@ -954,9 +997,9 @@ impl Session {
             self.next_recv,
             self.receive_window(),
             0,
-            u8::try_from(prefix.len()).expect("prefix padding <= 32"),
+            u8::try_from(prefix.len()).expect("prefix padding <= 255"),
             0,
-            u8::try_from(suffix.len()).expect("suffix padding <= 32"),
+            u8::try_from(suffix.len()).expect("suffix padding <= 255"),
         );
         let frame = self.encode_segment(metadata, &[], prefix, suffix)?;
         self.outgoing.push_back(frame);
@@ -1017,8 +1060,12 @@ pub fn seq_ge(a: u32, b: u32) -> bool {
     !seq_lt(a, b)
 }
 
-/// Heartbeat jitter of reference §2.5: uniform `[-1000, 1000]` ms plus, with
-/// probability 1/8, a long tail of `[1, 8000]` ms.
+/// Heartbeat interval, drawn uniformly from
+/// [`HEARTBEAT_MIN_INTERVAL`, `HEARTBEAT_MAX_INTERVAL`].
+///
+/// A narrow base interval plus a rare long tail concentrated 87.5% of
+/// heartbeats into a 4-6s beacon. A single wide uniform distribution removes
+/// that spike while keeping every interval far below the NAT timeout.
 #[must_use]
 pub fn heartbeat_jitter() -> Duration {
     heartbeat_jitter_with(&mut rand::rng())
@@ -1027,16 +1074,9 @@ pub fn heartbeat_jitter() -> Duration {
 /// Deterministic jitter helper used by tests and simulators.
 #[must_use]
 pub fn heartbeat_jitter_with<R: Rng + ?Sized>(rng: &mut R) -> Duration {
-    let mut millis: i64 =
-        rng.random_range(-SESSION_HEARTBEAT_JITTER_MS..=SESSION_HEARTBEAT_JITTER_MS);
-    if rng.random_range(0..SESSION_HEARTBEAT_LONG_TAIL_DIVISOR) == 0 {
-        millis += rng.random_range(1..=SESSION_HEARTBEAT_LONG_TAIL_MS);
-    }
-    if millis < 0 {
-        SESSION_HEARTBEAT_INTERVAL.saturating_sub(Duration::from_millis(millis.unsigned_abs()))
-    } else {
-        SESSION_HEARTBEAT_INTERVAL.saturating_add(Duration::from_millis(millis as u64))
-    }
+    let min = HEARTBEAT_MIN_INTERVAL.as_millis() as u64;
+    let max = HEARTBEAT_MAX_INTERVAL.as_millis() as u64;
+    Duration::from_millis(rng.random_range(min..=max))
 }
 
 fn random_nonce() -> WireNonce {
@@ -1089,11 +1129,19 @@ mod tests {
 
     #[test]
     fn heartbeat_jitter_stays_within_bounds() {
+        let mut min_seen = Duration::MAX;
+        let mut max_seen = Duration::ZERO;
         for _ in 0..1000 {
             let jitter = heartbeat_jitter();
-            assert!(jitter >= Duration::from_millis(3000), "{jitter:?}");
-            assert!(jitter <= Duration::from_secs(14), "{jitter:?}");
+            assert!(jitter >= HEARTBEAT_MIN_INTERVAL, "{jitter:?}");
+            assert!(jitter <= HEARTBEAT_MAX_INTERVAL, "{jitter:?}");
+            min_seen = min_seen.min(jitter);
+            max_seen = max_seen.max(jitter);
         }
+        // The distribution must span the range, not pile up into a narrow
+        // beacon (the old base+long-tail shape failed this).
+        assert!(min_seen < HEARTBEAT_MIN_INTERVAL + Duration::from_secs(2));
+        assert!(max_seen > HEARTBEAT_MAX_INTERVAL - Duration::from_secs(2));
     }
 
     #[test]
@@ -1130,6 +1178,31 @@ mod tests {
             "padding length must not be constant (fingerprint)"
         );
         assert!(Session::random_padding(0).is_empty());
+    }
+
+    #[test]
+    fn ack_padding_envelope_is_widened() {
+        let (mut client, _) = pair(TransportMode::Datagram);
+        let mut max_padding = 0usize;
+        for _ in 0..256 {
+            client.encode_ack().unwrap();
+            let frame = client.poll_output().unwrap();
+            let decoded = shadowlemon_wire::decode_segment(&AeadCipher::new(key(1)), &frame, &{
+                shadowlemon_wire::DecodeOptions {
+                    include_nonce: true,
+                    implicit_metadata_nonce: [0; WIRE_LEN],
+                    payload_nonce: shadowlemon_wire::PayloadNonce::UdpFlip,
+                }
+            })
+            .unwrap();
+            max_padding = max_padding
+                .max(usize::from(decoded.metadata.prefix_len()))
+                .max(usize::from(decoded.metadata.suffix_len()));
+        }
+        assert!(
+            max_padding > MAX_PREFIX_PADDING,
+            "ACK padding must be able to exceed the old 32-byte cap (got {max_padding})"
+        );
     }
 
     #[test]
@@ -1176,7 +1249,25 @@ mod tests {
             .tick(now + timeout + Duration::from_millis(1))
             .unwrap();
         let retry = client.poll_output().expect("retransmitted frame");
-        assert_eq!(retry, first);
+        // A retry keeps the sequence number so the peer can deduplicate, but
+        // must not be a byte-for-byte copy: it gets a fresh nonce and padding.
+        assert_ne!(retry, first);
+        let decode_options = || shadowlemon_wire::DecodeOptions {
+            include_nonce: true,
+            implicit_metadata_nonce: [0; WIRE_LEN],
+            payload_nonce: shadowlemon_wire::PayloadNonce::UdpFlip,
+        };
+        let first_seq =
+            shadowlemon_wire::decode_segment(&AeadCipher::new(key(1)), &first, &decode_options())
+                .unwrap()
+                .metadata
+                .sequence();
+        let retry_seq =
+            shadowlemon_wire::decode_segment(&AeadCipher::new(key(1)), &retry, &decode_options())
+                .unwrap()
+                .metadata
+                .sequence();
+        assert_eq!(retry_seq, first_seq);
         assert_eq!(client.send_buf.values().next().unwrap().tx_count, 2);
         server.on_frame(&retry, now).unwrap();
         assert_eq!(server.try_recv(), Some(b"loss".to_vec()));

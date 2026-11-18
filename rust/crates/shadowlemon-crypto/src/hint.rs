@@ -1,22 +1,27 @@
 //! Keyed user hints embedded in the last four bytes of a wire nonce.
 //!
 //! The hint is a fast filter that lets a server pick which user's key to try
-//! first. It is **not** an authentication check: anyone holding the pepper can
-//! compute it, so a match must never grant access by itself.
+//! first. It is **not** an authentication check: a match must never grant
+//! access by itself. The pepper is the process-wide deployment secret (see
+//! [`crate::deployment::deployment_secret`]); using a public hardcoded value
+//! would let a passive observer enumerate usernames offline.
 
 use sha2::{Digest, Sha256};
 
-use crate::{constant_time_eq, WireNonce, HINT_LEN, HINT_NONCE_PREFIX_LEN};
+use crate::{
+    constant_time_eq, deployment::deployment_secret, WireNonce, HINT_LEN, HINT_NONCE_PREFIX_LEN,
+};
 
-/// Domain separator of the keyed user hint.
+/// Default domain separator of the keyed user hint, retained for backward
+/// compatibility. It is used only when no deployment secret is configured.
 pub const USER_HINT_PEPPER: &[u8] = b"ShadowLemon V0.2 user hint pepper";
 
 /// Compute the four-byte keyed hint of `username` for a wire nonce:
-/// `SHA256("ShadowLemon V0.2 user hint pepper" || username || nonce[0:16])[0:4]`.
+/// `SHA256(deployment_secret() || username || nonce[0:16])[0:4]`.
 #[must_use]
 pub fn user_hint(username: &[u8], wire_nonce: &WireNonce) -> [u8; HINT_LEN] {
     let mut hasher = Sha256::new();
-    hasher.update(USER_HINT_PEPPER);
+    hasher.update(deployment_secret());
     hasher.update(username);
     hasher.update(&wire_nonce[..HINT_NONCE_PREFIX_LEN]);
     let digest = hasher.finalize();

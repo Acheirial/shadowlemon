@@ -318,6 +318,8 @@ impl Server {
         // Maps a responder address to the verbatim header of the request that
         // created it, so the response uses the address type the client expects.
         let mut headers: HashMap<SocketAddr, Vec<u8>> = HashMap::new();
+        // Fallback keyed by destination port for pass-through (domain) targets.
+        let mut reply_headers: HashMap<u16, Vec<u8>> = HashMap::new();
         let mut from_client = vec![0u8; MAX_UDP_DATAGRAM];
         let mut from_outbound = vec![0u8; MAX_UDP_DATAGRAM];
         let mut control = [0u8; 1];
@@ -358,10 +360,19 @@ impl Server {
                         continue;
                     }
                     let target = SocketAddr::new(ip, datagram.port);
-                    if let Err(err) = outbound.send_to(&datagram.payload, target).await {
+                    if let Err(err) = outbound
+                        .send_to_host(&datagram.payload, target, host.as_deref())
+                        .await
+                    {
                         tracing::debug!("outbound UDP send failed: {err}");
                         continue;
                     }
+                    // With a pass-through resolver `ip` is a loopback
+                    // placeholder while the real responder reports its actual
+                    // IP on reply, so the exact-key lookup below would miss.
+                    // Index by port as a fallback; UDP association ports are
+                    // unique per destination in the common case.
+                    reply_headers.insert(datagram.port, datagram.header.clone());
                     headers.insert(target, datagram.header);
                 }
 
@@ -373,7 +384,10 @@ impl Server {
                             continue;
                         }
                     };
-                    let (Some(header), Some(client)) = (headers.get(&source), client_addr) else {
+                    let header = headers
+                        .get(&source)
+                        .or_else(|| reply_headers.get(&source.port()));
+                    let (Some(header), Some(client)) = (header, client_addr) else {
                         // Off-path datagram: never inject it into the client.
                         continue;
                     };

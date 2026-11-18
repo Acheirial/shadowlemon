@@ -8,6 +8,7 @@
 //! * [`kex`] – ephemeral X25519 key agreement with low-order point rejection.
 //! * [`aead`] – 24-byte wire nonces, AEAD nonce truncation and payload nonces.
 //! * [`hint`] – keyed four-byte user hints embedded in wire nonces.
+//! * [`deployment`] – process-wide deployment secret and envelope keystream.
 //! * [`envelope`] – handshake request/response serialisation and validation.
 
 #![forbid(unsafe_code)]
@@ -16,11 +17,14 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub mod aead;
+pub mod deployment;
 pub mod envelope;
 pub mod hint;
 pub mod kdf;
 pub mod kex;
 pub mod suite;
+
+pub use deployment::{deployment_secret, envelope_keystream};
 
 /// Length of the nonce carried on the wire, in bytes. This is the same for
 /// every cipher suite; the AEAD nonce is derived from it (see [`aead`]).

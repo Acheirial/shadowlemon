@@ -1,6 +1,9 @@
 //! Name resolution abstraction.
 
-use std::{io, net::IpAddr};
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr},
+};
 
 use futures::future::BoxFuture;
 
@@ -35,6 +38,28 @@ impl Resolver for SystemResolver {
                 Ok(resolved)
             }
         })
+    }
+}
+
+/// A [`Resolver`] that never performs a DNS lookup.
+///
+/// In an end-to-end encrypted tunnel the original hostname is carried inside
+/// the tunnel as `Address::Domain` and resolved at the server's egress. Local
+/// resolution would leak the target domain to the client's DNS resolver, so
+/// this resolver hands back a loopback placeholder instead. The tunnel driver
+/// prefers the `host` string over this IP when building the upstream request;
+/// only the port is taken from the local socket address.
+///
+/// Caveat: TCP CONNECT works because `open_tcp` always uses the `host` string.
+/// Per-datagram UDP targets currently travel as `Address::Ip` (see
+/// `TunnelDatagramSocket::send_to` in the protocol crate), so domain-based UDP
+/// destinations still need that driver path to prefer the domain as well.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PassThroughResolver;
+
+impl Resolver for PassThroughResolver {
+    fn lookup_ip<'a>(&'a self, _host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+        Box::pin(async move { Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]) })
     }
 }
 
@@ -117,5 +142,17 @@ mod tests {
 
         let unknown = Address::Domain("missing.example".into());
         assert!(resolve_target(&unknown, &resolver).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pass_through_resolver_never_looks_up_the_domain() {
+        let domain = Address::Domain("secret.example".into());
+        assert_eq!(
+            resolve_target(&domain, &PassThroughResolver).await.unwrap(),
+            (
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                Some("secret.example".into())
+            )
+        );
     }
 }

@@ -57,6 +57,23 @@ pub trait DatagramSocket: Send + Sync {
         target: SocketAddr,
     ) -> BoxFuture<'a, io::Result<usize>>;
 
+    /// Send a datagram whose destination was a domain name.
+    ///
+    /// When the local SOCKS5 ingress deliberately avoids resolving domains
+    /// (to keep the hostname inside the encrypted tunnel), the resolved
+    /// `target` is only a placeholder. Implementations that understand named
+    /// destinations should override this and forward `host`; the default
+    /// ignores it and falls back to [`Self::send_to`].
+    fn send_to_host<'a>(
+        &'a self,
+        data: &'a [u8],
+        target: SocketAddr,
+        host: Option<&'a str>,
+    ) -> BoxFuture<'a, io::Result<usize>> {
+        let _ = host;
+        self.send_to(data, target)
+    }
+
     /// Receives one datagram into `buf`, returning its length and source.
     fn recv_from<'a>(&'a self, buf: &'a mut [u8])
         -> BoxFuture<'a, io::Result<(usize, SocketAddr)>>;

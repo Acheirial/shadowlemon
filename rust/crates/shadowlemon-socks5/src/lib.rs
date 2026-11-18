@@ -120,7 +120,7 @@ pub use proto::{
     REP_ADDR_TYPE_NOT_SUPPORTED, REP_COMMAND_NOT_SUPPORTED, REP_CONNECTION_REFUSED,
     REP_HOST_UNREACHABLE, REP_NETWORK_UNREACHABLE, REP_NOT_ALLOWED, REP_SUCCESS, VERSION,
 };
-pub use resolver::{resolve_target, Resolver, SystemResolver};
+pub use resolver::{resolve_target, PassThroughResolver, Resolver, SystemResolver};
 pub use server::{Config, Server, DEFAULT_HANDSHAKE_TIMEOUT, MAX_UDP_ASSOCIATIONS_PER_USER};
 
 /// Errors produced by the SOCKS5 server.
