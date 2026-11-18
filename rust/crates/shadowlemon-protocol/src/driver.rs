@@ -96,7 +96,7 @@ use crate::{
     },
     mux::{self, Endpoint, TransportKind},
     serveruser::{Registry, SourceKey, User},
-    session::{Direction, Session, SessionConfig, TransportMode},
+    session::{Direction, Session, SessionConfig, SessionError, TransportMode},
     stream::DatagramStream,
     underlay::{IpFamily, MtuBudget, MAX_PREFIX_PADDING, MAX_SUFFIX_PADDING},
     underlay_packet::PacketConfig,
@@ -253,7 +253,7 @@ impl RealServerConfig {
 /// The real client-side [`mux::ClientHandshake`] adapter.
 pub struct RealClientHandshake {
     config: RealClientConfig,
-    udp_sessions: DashMap<u32, Arc<UdpSessionHandle>>,
+    udp_sessions: Arc<DashMap<u32, Arc<UdpSessionHandle>>>,
 }
 
 impl std::fmt::Debug for RealClientHandshake {
@@ -272,7 +272,7 @@ impl RealClientHandshake {
         config.validate()?;
         Ok(Self {
             config,
-            udp_sessions: DashMap::new(),
+            udp_sessions: Arc::new(DashMap::new()),
         })
     }
 
@@ -333,7 +333,7 @@ impl mux::ClientHandshake for RealClientHandshake {
             } else {
                 "[::]:0".parse().expect("literal address")
             };
-            let socket = Arc::new(UdpSocket::bind(bind).await?);
+            let socket = Arc::new(bind_transport_udp(bind)?);
             let address = match host {
                 Some(name) if !name.is_empty() => Address::Domain(name.to_owned()),
                 _ => Address::Ip(target.ip()),
@@ -400,12 +400,13 @@ impl mux::ClientHandshake for RealClientHandshake {
             );
             let key_state = Arc::new(KeyUpgradeState::new());
             let ticker_wake = Arc::new(Notify::new());
+            let session_shutdown = Arc::clone(&handle.shutdown);
             spawn_client_ticker(
                 Arc::clone(&session),
                 Arc::clone(&socket),
                 server,
                 session_id,
-                Arc::clone(&handle.shutdown),
+                Arc::clone(&session_shutdown),
                 Arc::clone(&ticker_wake),
             );
             spawn_stream_key_upgrade(
@@ -435,6 +436,8 @@ impl mux::ClientHandshake for RealClientHandshake {
                     inbound: Some(inbound),
                     key_state: Some(key_state),
                     ticker_wake,
+                    session_shutdown,
+                    session_registry: Arc::clone(&self.udp_sessions),
                 }),
                 target,
             ));
@@ -461,7 +464,7 @@ impl mux::ClientHandshake for RealClientHandshake {
             } else {
                 "[::]:0".parse().expect("literal address")
             };
-            let socket = Arc::new(UdpSocket::bind(bind).await?);
+            let socket = Arc::new(bind_transport_udp(bind)?);
             let address = match host {
                 Some(name) if !name.is_empty() => Address::Domain(name.to_owned()),
                 _ => Address::Ip(target.ip()),
@@ -529,12 +532,13 @@ impl mux::ClientHandshake for RealClientHandshake {
                 shutdown: Arc::new(Notify::new()),
             });
             let ticker_wake = Arc::new(Notify::new());
+            let session_shutdown = Arc::clone(&handle.shutdown);
             spawn_client_ticker(
                 Arc::clone(&session),
                 Arc::clone(&socket),
                 server,
                 session_id,
-                Arc::clone(&handle.shutdown),
+                Arc::clone(&session_shutdown),
                 Arc::clone(&ticker_wake),
             );
             self.udp_sessions.insert(session_id, handle);
@@ -554,6 +558,8 @@ impl mux::ClientHandshake for RealClientHandshake {
                 inbound: None,
                 key_state: None,
                 ticker_wake,
+                session_shutdown,
+                session_registry: Arc::clone(&self.udp_sessions),
             });
             Ok(tunnel)
         })
@@ -656,6 +662,7 @@ impl RealServerHandshake {
                 .ok_or_else(|| invalid_data("egress proxy is missing"))?;
             let proxy_ip = resolve_host(&proxy.host).await?;
             let mut stream = TcpStream::connect(SocketAddr::new(proxy_ip, proxy.port)).await?;
+            let _ = stream.set_nodelay(true);
             socks5_client_handshake(&mut stream, proxy.credential.as_ref()).await?;
             stream.write_all(raw_request).await?;
             stream.flush().await?;
@@ -664,9 +671,9 @@ impl RealServerHandshake {
             read_socks5_address_tail(&mut stream, reply[3]).await?;
             return Ok(Box::new(stream));
         }
-        Ok(Box::new(
-            TcpStream::connect(SocketAddr::new(ip, port)).await?,
-        ))
+        let stream = TcpStream::connect(SocketAddr::new(ip, port)).await?;
+        let _ = stream.set_nodelay(true);
+        Ok(Box::new(stream))
     }
 
     fn udp_peer(&self, source: SocketAddr, session_id: u32) -> io::Result<Arc<ServerUdpSession>> {
@@ -1083,9 +1090,29 @@ fn drain_output(session: &mut Session) -> Vec<Vec<u8>> {
     std::iter::from_fn(|| session.poll_output()).collect()
 }
 
-/// Send one wire datagram and then yield briefly. Bulk replies are split into
-/// many fragments; pacing them avoids a back-to-back micro-burst whose regular
-/// inter-packet gaps would be an obvious traffic fingerprint.
+/// Bind the transport UDP socket with a generous receive buffer.
+///
+/// A 1 MiB reply is ~870 datagrams. The Linux default `SO_RCVBUF` (~208 KiB)
+/// overflows when the sender bursts them, and the resulting loss triggers
+/// multi-second retransmission backoff even on loopback. A 4 MiB buffer is
+/// best-effort — the kernel may cap it at `net.core.rmem_max`.
+fn bind_transport_udp(bind: SocketAddr) -> io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = match bind {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_nonblocking(true)?;
+    let _ = socket.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
+    socket.bind(&bind.into())?;
+    UdpSocket::from_std(socket.into())
+}
+
+/// Send one wire datagram. Kept as a helper so the bulk-reply paths share a
+/// single send point; deliberate pacing was removed because it cut throughput
+/// without a measurable fingerprint benefit on the tested link.
 async fn send_paced(socket: &UdpSocket, wire: &[u8], target: SocketAddr) -> io::Result<()> {
     socket.send_to(wire, target).await?;
     Ok(())
@@ -1210,22 +1237,37 @@ struct TunnelDatagramSocket {
     key_state: Option<Arc<KeyUpgradeState>>,
     /// Wakes the client ticker when an inbound frame may have armed a timer.
     ticker_wake: Arc<Notify>,
+    /// Stop signal shared with the ticker and inbound reader; signalled from
+    /// `Drop` so completed CONNECT/UDP sessions do not leak tasks.
+    session_shutdown: Arc<Notify>,
+    /// Registry entry to remove on drop (keeps the client session map bounded).
+    session_registry: Arc<DashMap<u32, Arc<UdpSessionHandle>>>,
+}
+
+impl Drop for TunnelDatagramSocket {
+    fn drop(&mut self) {
+        self.session_shutdown.notify_waiters();
+        self.session_registry.remove(&self.session_id);
+    }
 }
 
 impl TunnelDatagramSocket {
     /// Decrypt one session-reply frame, send any ACKs it produced, and return
     /// the reassembled application chunks.
     async fn process_reply(&self, frame: &[u8]) -> io::Result<Vec<Vec<u8>>> {
-        let chunks = {
+        // Keep the session lock strictly synchronous: decrypt, collect
+        // plaintext and take pending ACK frames, then release before any
+        // network send so the ticker is never blocked by socket I/O.
+        let (chunks, frames) = {
             let mut session = self.session.lock().await;
             session.on_frame(frame, Instant::now()).map_err(io_err)?;
             let chunks: Vec<Vec<u8>> = std::iter::from_fn(|| session.try_recv()).collect();
-            for ack in drain_output(&mut session) {
-                let wire = wrap_udp(UDP_KIND_SESSION_DATA, self.session_id, &ack);
-                send_paced(&self.socket, &wire, self.server).await?;
-            }
-            chunks
+            (chunks, drain_output(&mut session))
         };
+        for ack in frames {
+            let wire = wrap_udp(UDP_KIND_SESSION_DATA, self.session_id, &ack);
+            send_paced(&self.socket, &wire, self.server).await?;
+        }
         // `on_frame` may have armed a delayed-ACK or retransmission deadline
         // while the ticker was sleeping on an older snapshot.
         self.ticker_wake.notify_one();
@@ -1258,14 +1300,32 @@ impl TunnelDatagramSocket {
         datagram.extend_from_slice(data);
         let id = self.message_id.fetch_add(1, Ordering::Relaxed);
         let fragments = fragment_payload(&datagram, self.max_fragment, id)?;
-        let mut session = self.session.lock().await;
-        for fragment in fragments {
-            session.send(&fragment).await.map_err(io_err)?;
-        }
-        session.tick(Instant::now()).map_err(io_err)?;
-        for frame in drain_output(&mut session) {
-            let wire = wrap_udp(UDP_KIND_SESSION_DATA, self.session_id, &frame);
-            send_paced(&self.socket, &wire, self.server).await?;
+        // Enqueue fragments without holding the session lock across the
+        // backpressure wait or the network send. On backpressure, re-acquire the
+        // space notification from a short-lived lock, release it, then await.
+        let mut next = 0;
+        loop {
+            let frames = {
+                let mut session = self.session.lock().await;
+                while next < fragments.len() {
+                    match session.try_send(&fragments[next]) {
+                        Ok(_) => next += 1,
+                        Err(SessionError::Backpressure) => break,
+                        Err(err) => return Err(io_err(err)),
+                    }
+                }
+                session.tick(Instant::now()).map_err(io_err)?;
+                drain_output(&mut session)
+            };
+            for frame in frames {
+                let wire = wrap_udp(UDP_KIND_SESSION_DATA, self.session_id, &frame);
+                send_paced(&self.socket, &wire, self.server).await?;
+            }
+            if next == fragments.len() {
+                break;
+            }
+            let space = self.session.lock().await.space_wake();
+            space.notified().await;
         }
         Ok(data.len())
     }
@@ -1392,6 +1452,11 @@ struct ServerUdpSession {
     replies: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
     reply_tx: mpsc::UnboundedSender<Vec<u8>>,
     pending_frames: Mutex<VecDeque<Vec<u8>>>,
+    /// Monotonic application-fragment id, avoiding an O(datagram) content hash
+    /// on every large reply (the client uses the same counter approach).
+    message_id: AtomicU32,
+    /// Fragments that did not fit the send queue yet, retried on the next ACK.
+    pending_fragments: Mutex<VecDeque<Vec<u8>>>,
     /// Woken when an inbound frame (ACK) may unblock more reply frames.
     flusher_wake: Notify,
     created: Instant,
@@ -1436,6 +1501,8 @@ impl ServerUdpSession {
             replies: Mutex::new(replies),
             reply_tx,
             pending_frames: Mutex::new(VecDeque::new()),
+            message_id: AtomicU32::new(1),
+            pending_fragments: Mutex::new(VecDeque::new()),
             flusher_wake: Notify::new(),
             created: Instant::now(),
             max_fragment,
@@ -1462,26 +1529,43 @@ impl ServerUdpSession {
         self.pending_frames.lock().await.drain(..).collect()
     }
 
-    /// Encode one plaintext reply into the session's send queue and flush every
-    /// frame the session is currently willing to emit straight to the client.
-    async fn flush_reply(&self, datagram: &[u8]) {
-        let id = {
-            let mut counter = 0u32;
-            for byte in datagram {
-                counter = counter.wrapping_mul(31).wrapping_add(u32::from(*byte));
+    /// Move queued fragments into the session's send queue and take every frame
+    /// it is currently willing to emit. Fragments that hit backpressure stay in
+    /// `pending_fragments` and are retried on the next ACK wake, so the session
+    /// lock is never held across a network send or a backpressure wait.
+    async fn drain_reply_output(&self) -> Vec<Vec<u8>> {
+        let pending: Vec<Vec<u8>> = {
+            let mut queue = self.pending_fragments.lock().await;
+            queue.drain(..).collect()
+        };
+        let mut deferred = Vec::new();
+        let frames = {
+            let mut session = self.session.lock().await;
+            for fragment in pending {
+                match session.try_send(&fragment) {
+                    Ok(_) => {}
+                    Err(SessionError::Backpressure) => {
+                        deferred.push(fragment);
+                        break;
+                    }
+                    Err(_) => break, // session closed / invalid: drop the fragment
+                }
             }
-            counter
+            let _ = session.tick(Instant::now());
+            drain_output(&mut session)
         };
-        let fragments = match fragment_payload(datagram, self.max_fragment, id) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        let mut session = self.session.lock().await;
-        for fragment in fragments {
-            let _ = session.send(&fragment).await;
+        if !deferred.is_empty() {
+            let mut queue = self.pending_fragments.lock().await;
+            for fragment in deferred.into_iter().rev() {
+                queue.push_front(fragment);
+            }
         }
-        let _ = session.tick(Instant::now());
-        for frame in drain_output(&mut session) {
+        frames
+    }
+
+    /// Send frames outside of the session lock.
+    async fn send_reply_frames(&self, frames: Vec<Vec<u8>>) {
+        for frame in frames {
             let wire = wrap_udp(UDP_KIND_SESSION_REPLY, self.session_id, &frame);
             if let Err(err) = send_paced(&self.reply_socket, &wire, self.client).await {
                 debug!(%err, "background UDP reply send failed");
@@ -1489,17 +1573,28 @@ impl ServerUdpSession {
         }
     }
 
+    /// Encode one plaintext reply into the session's send queue and flush every
+    /// frame the session is currently willing to emit straight to the client.
+    async fn flush_reply(&self, datagram: &[u8]) {
+        let id = self.message_id.fetch_add(1, Ordering::Relaxed);
+        let Ok(fragments) = fragment_payload(datagram, self.max_fragment, id) else {
+            return;
+        };
+        {
+            let mut queue = self.pending_fragments.lock().await;
+            for fragment in fragments.into_iter().rev() {
+                queue.push_front(fragment);
+            }
+        }
+        let frames = self.drain_reply_output().await;
+        self.send_reply_frames(frames).await;
+    }
+
     /// Flush any frames the session can emit now (e.g. after an ACK advanced
     /// the send window), without new plaintext input.
     async fn flush_pending_output(&self) {
-        let mut session = self.session.lock().await;
-        let _ = session.tick(Instant::now());
-        for frame in drain_output(&mut session) {
-            let wire = wrap_udp(UDP_KIND_SESSION_REPLY, self.session_id, &frame);
-            if let Err(err) = send_paced(&self.reply_socket, &wire, self.client).await {
-                debug!(%err, "background UDP reply send failed");
-            }
-        }
+        let frames = self.drain_reply_output().await;
+        self.send_reply_frames(frames).await;
     }
 
     /// Start a background task that turns queued plaintext replies into
@@ -1542,7 +1637,7 @@ impl ServerUdpSession {
                 } else {
                     "[::]:0".parse().expect("literal address")
                 };
-                let socket = Arc::new(UdpSocket::bind(bind).await?);
+                let socket = Arc::new(bind_transport_udp(bind)?);
                 *outbound = Some(Arc::clone(&socket));
                 spawn_udp_reply_reader(Arc::clone(&socket), self.reply_tx.clone());
                 socket

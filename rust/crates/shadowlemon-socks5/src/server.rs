@@ -145,6 +145,7 @@ impl Server {
         let listener = TcpListener::bind(addr).await?;
         loop {
             let (stream, _) = listener.accept().await?;
+            let _ = stream.set_nodelay(true);
             let server = self.clone();
             tokio::spawn(async move {
                 if let Err(err) = server.serve(stream).await {

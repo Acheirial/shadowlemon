@@ -343,7 +343,7 @@ pub struct Session {
     replay: ReplayCache,
     plaintext_tx: mpsc::Sender<Vec<u8>>,
     plaintext_rx: Option<mpsc::Receiver<Vec<u8>>>,
-    space_notify: Notify,
+    space_notify: std::sync::Arc<Notify>,
     ack_deadline: Option<Instant>,
     heartbeat_at: Instant,
     segments_since_window_ack: u32,
@@ -410,7 +410,7 @@ impl Session {
             replay: ReplayCache::new(replay_domain),
             plaintext_tx,
             plaintext_rx: Some(plaintext_rx),
-            space_notify: Notify::new(),
+            space_notify: std::sync::Arc::new(Notify::new()),
             ack_deadline: None,
             heartbeat_at: Instant::now() + heartbeat_jitter(),
             segments_since_window_ack: 0,
@@ -546,6 +546,15 @@ impl Session {
         }
     }
 
+    /// Handle for waiting on queue space *outside* the session lock. Callers
+    /// that must send frames over the network should use `try_send`, drop the
+    /// lock, then await `notified()` on this handle to avoid holding the lock
+    /// across I/O.
+    #[must_use]
+    pub fn space_wake(&self) -> std::sync::Arc<Notify> {
+        std::sync::Arc::clone(&self.space_notify)
+    }
+
     /// Move queued fragments into frames, respecting both congestion and the
     /// peer's advertised window.
     pub fn pump(&mut self, now: Instant) -> Result<(), SessionError> {
@@ -569,7 +578,9 @@ impl Session {
                 },
             );
             self.outgoing.push_back(frame);
-            self.space_notify.notify_waiters();
+            // Store a permit so a sender that released the session lock just
+            // before calling `notified().await` cannot miss this wakeup.
+            self.space_notify.notify_one();
         }
         Ok(())
     }
@@ -945,7 +956,12 @@ impl Session {
             return Vec::new();
         }
         let len = rand::random_range(0..=max);
-        (0..len).map(|_| rand::random::<u8>()).collect()
+        let mut bytes = vec![0u8; len];
+        // Fill in one RNG call instead of one per byte. ACK frames use up to
+        // 255 bytes of padding on each side, so this saves hundreds of RNG
+        // calls per ACK. The wire bytes are identically distributed.
+        rand::rng().fill_bytes(&mut bytes);
+        bytes
     }
 
     fn encode_data(&mut self, payload: &[u8], fragment: u8) -> Result<Vec<u8>, SessionError> {

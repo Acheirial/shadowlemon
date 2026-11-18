@@ -110,6 +110,11 @@ pub async fn run_client(path: PathBuf, stop: &'static AtomicI32) -> Result<(), A
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
+                        // SOCKS5 relays many small reads/writes; Nagle plus the
+                        // peer's delayed ACK would add a ~40 ms stall per burst.
+                        if let Err(error) = stream.set_nodelay(true) {
+                            warn!(%error, "failed to set TCP_NODELAY on SOCKS5 ingress");
+                        }
                         let server = server.clone();
                         tokio::spawn(async move {
                             if let Err(error) = server.serve(stream).await {

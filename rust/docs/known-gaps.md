@@ -6,7 +6,7 @@ Rust 已是 ShadowLemon 的唯一实现，Go 实现已随 V0.2 一起移除；V0
 
 ## 1. UDP 全双工回复通道（已实现）
 
-大响应卡住问题已修复。`ServerHandshake::accept_udp` 接收 mux 监听 socket 的共享句柄（`Arc<UdpSocket>`）并返回 `Vec<Vec<u8>>`；服务端会话持有客户端地址与该句柄，用后台 reply flusher 直接把排队回复帧发回客户端，绕过"每入站一轮"的模型。flusher 在入站 ACK 推进发送窗口后被唤醒，继续冲刷剩余帧。客户端会话有周期性 ticker 驱动延迟 ACK 与重传（此前客户端从不 `tick()`，导致服务端窗口不前进）。CONNECT 大响应（64KB body、约 50 个加密帧）端到端已验证：SHA-1 校验与完整 body 均通过，`end_to_end_connect_large_response_is_not_truncated` 覆盖该回归。残余风险：`client` 与 `server` 的 ticker 使用固定 2ms 间隔而非 `next_timer()` 精确唤醒，高吞吐下可能增加少量空转与 ACK 延迟。
+大响应卡住问题已修复。`ServerHandshake::accept_udp` 接收 mux 监听 socket 的共享句柄（`Arc<UdpSocket>`）并返回 `Vec<Vec<u8>>`；服务端会话持有客户端地址与该句柄，用后台 reply flusher 直接把排队回复帧发回客户端，绕过"每入站一轮"的模型。flusher 在入站 ACK 推进发送窗口后被唤醒，继续冲刷剩余帧。客户端会话有周期性 ticker 驱动延迟 ACK 与重传（此前客户端从不 `tick()`，导致服务端窗口不前进）。CONNECT 大响应（64KB body、约 50 个加密帧）端到端已验证：SHA-1 校验与完整 body 均通过，`end_to_end_connect_large_response_is_not_truncated` 覆盖该回归。客户端 ticker 后续已改为 `next_timer()` 精确唤醒 + 入站帧唤醒（见 §8），消除了该残余风险。
 
 ## 2. Android socket protect 尚未介入建连
 
@@ -67,3 +67,18 @@ UDP 客户端因已知的半双工回复缺口在压测下超时，样本量偏�
 **现状：外部传输已是 UDP-only，该系统不再适用。** USENIX'23 的被动检测器只检查客户端发出的第一个 TCP 数据包（§4.4–4.5），不做 UDP 检测；因此当前 ShadowLemon 的所有流量都不进入该判定路径。换端口对 GFW 无效（它按目标 IP 段与首包特征判定，且所有端口都可封），但这一点对 UDP 同样只是次要因素。QDPI 的 `entropy_score` 分析仍然成立：加密数据报的高熵特征依然可被统计型分类器利用，与传输是 TCP 还是 UDP 无关。详见 `docs/gfw-assessment.md`。
 
 已落地 `tools/gfw-search.rs`（OpenGFW FET 分析器离线移植 + 规避前缀自动搜索）：对历史 TCP 首包实测整改前后均 60/60 BLOCK；搜索确认 6 字节随机可打印前缀、TLS 魔数、HTTP 方法三类方案均在 20 条首包 × 4 次采样（80/80）下稳定豁免。**这些方案从未实施，也不再需要实施到 TCP 路径**——TCP accept 路径已随外部 TCP 传输一并移除。若未来要针对 UDP 做规避，需要在 UDP 握手/早期数据路径上做等价的前缀处理并重新抓包验证；当前暂无此计划。
+
+## 11. 性能优化（相对 TLS 1.3）
+
+V0.2 已是 0-RTT（TLS 1.3 首次握手为 1-RTT），握手往返本身优于 TLS。对数据面的专项审计发现并修复了以下相对 TLS 1.3 的性能劣势；所有改动均**保持 V0.2 线格式不变**（版本字节仍为 4）：
+
+- **静态密钥重复 PBKDF2（最大单项）**：`derive_static_key` 每次调用要跑 4096 轮 PBKDF2-HMAC-SHA256（实测 **387 µs/次**），而 TLS 1.3 的 key schedule 只有少量 HKDF（几十次 SHA 压缩），完全不做 PBKDF2。原实现客户端每条连接调用 3 次、服务端 1 次。现改为按 `(SHA256(password||0x00||username), suite)` 全局缓存派生结果（缓存命中 **113 ns/次，约 3400 倍**），并把 `ClientHandshake` 的静态密钥保存为字段、`early_keys()` 直接复用。缓存不会削弱离线口令猜测难度（攻击者仍需对每个猜测跑完整 PBKDF2）。固定 salt 也改为 `OnceLock` 只算一次。
+- **Nagle + 延迟 ACK 造成 ~40 ms 尾延迟（端到端最大收益）**：SOCKS5 入口接受的 TCP 流未设置 `TCP_NODELAY`。SOCKS5 大量小读写与对端延迟 ACK 叠加，每个请求突发被拖住约 40 ms（直接连 HTTP 源站 <1 ms）。现对客户端 SOCKS5 入口、socks5 示例监听器和服务端出口 TCP 连接统一 `set_nodelay(true)`。实测 50 条新连接（每条一个 64KB HTTP 响应）从 **98 ms/连接降至 7 ms/连接**（约 14 倍）。
+- **会话锁跨 await**：服务端 `flush_reply`/`flush_pending_output` 与客户端 `process_reply`/`send_with_host` 原先在持有 `Arc<Mutex<Session>>` 时做网络发送和背压等待，会把 ticker / ACK 处理串行化，并在队列满时存在自锁风险。现改为「取锁→同步处理→取出待发帧→释放锁→再 await 发送」，背压片段暂存并在 ACK 唤醒后重试。
+- **大响应逐字节哈希**：服务端 `flush_reply` 原对 60KB 体逐字节算消息 ID（O(n)），改为与客户端一致的 `AtomicU32` 自增计数器。
+- **ACK 随机填充的 RNG 调用**：`random_padding` 原逐字节调用 RNG（单个 ACK 最多 510 次），改为一次 `fill_bytes` 填充，分布不变。
+- **完成会话的任务泄漏**：客户端 `TunnelDatagramSocket` 析构时原先不通知 ticker / 入站 reader，也不从注册表移除会话；大量短连接会累积常驻任务。现 `Drop` 中触发 shutdown 并移除会话条目。
+- **UDP 套接字缓冲区**：传输 UDP 套接字在创建时尽力把 `SO_RCVBUF`/`SO_SNDBUF` 设为 4 MiB（受内核 `rmem_max` 上限约束），减少大响应突发时的丢包与重传退避。
+- **每帧微小开销**：AEAD cipher 实例本就复用（与 TLS 一致）；`derive_early_keys`（HKDF×2，约 790 ns）、`envelope_keystream`（SHA-256，约 46 ns）、X25519（每握手 2 次标量乘，与 TLS 1.3 的临时 ECDHE 等价）均非瓶颈。仍存在的结构性开销是每帧双 AEAD（元数据 + 载荷）、随机 padding、用户态 ARQ 与约 13 次堆分配/片——这些是抗指纹与可靠性的显式取舍，TLS 用内核卸载与零拷贝把每字节成本压低一个数量级。
+
+**实测基线（`unshare -Urnm` 命名空间内、lo）：** 静态密钥派生 387 µs → 113 ns（缓存命中）；新连接端到端 98 ms → 7 ms。剩余的 1 MiB 大响应在纯 loopback 压测下仍会因丢包 + RTO 退避出现偶发秒级尾延迟，属自定义用户态 ARQ 在无网络 pacing 的回环环境中的局限；WAN 部署由链路本身提供 pacing。

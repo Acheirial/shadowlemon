@@ -3,6 +3,11 @@
 //! All constants and byte concatenations in this module are part of the wire
 //! protocol. Do not reformat the domain-separation strings.
 
+use std::{
+    collections::HashMap,
+    sync::{OnceLock, RwLock},
+};
+
 use hkdf::Hkdf;
 use pbkdf2::pbkdf2_hmac;
 use sha2::{Digest, Sha256};
@@ -102,11 +107,28 @@ pub fn hash_password(password: &[u8], username: &str) -> [u8; KEY_LEN] {
     hasher.finalize().into()
 }
 
-/// Fixed salt of the static key derivation.
+/// Fixed salt of the static key derivation, computed once per process.
 #[must_use]
 pub fn static_key_salt() -> [u8; KEY_LEN] {
-    Sha256::digest(STATIC_KEY_SALT_INFO).into()
+    static SALT: OnceLock<[u8; KEY_LEN]> = OnceLock::new();
+    *SALT.get_or_init(|| Sha256::digest(STATIC_KEY_SALT_INFO).into())
 }
+
+/// Cache of PBKDF2 results, keyed by the already-hashed password and suite.
+///
+/// The static key depends only on `(SHA256(password || 0x00 || username),
+/// suite)`, both of which are fixed for a configured user. PBKDF2 with 4096
+/// iterations costs hundreds of microseconds, so recomputing it on every
+/// connection is pure waste for legitimate repeated handshakes. Caching the
+/// derived bytes does not weaken the offline password-guessing resistance:
+/// an attacker still has to run the full PBKDF2 for every guessed password.
+/// This mirrors TLS session resumption caching the result of expensive key
+/// derivation rather than repeating it.
+type StaticKeyCacheKey = ([u8; KEY_LEN], u8);
+static STATIC_KEY_CACHE: OnceLock<RwLock<HashMap<StaticKeyCacheKey, StaticKey>>> = OnceLock::new();
+/// Configs hold a handful of users; the cap only guards against unbounded
+/// growth from hostile/fuzzed credentials.
+const STATIC_KEY_CACHE_LIMIT: usize = 256;
 
 /// Derive the static envelope key of a user.
 ///
@@ -125,6 +147,16 @@ pub fn derive_static_key(
         return Err(CryptoError::UnknownSuite(envelope_suite.as_u8()));
     }
     let hashed = hash_password(password, username);
+    let cache = STATIC_KEY_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    let cache_key = (hashed, envelope_suite.as_u8());
+    if let Some(cached) = cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&cache_key)
+    {
+        return Ok(cached.clone());
+    }
+
     let salt = static_key_salt();
     let mut all = [0u8; KEY_LEN];
     pbkdf2_hmac::<Sha256>(&hashed, &salt, PBKDF2_ITERATIONS, &mut all);
@@ -133,7 +165,14 @@ pub fn derive_static_key(
     let mut bytes = [0u8; KEY_LEN];
     bytes[..len].copy_from_slice(&all[..len]);
     all.zeroize();
-    Ok(StaticKey { bytes, len })
+    let key = StaticKey { bytes, len };
+
+    if let Ok(mut map) = cache.write() {
+        if map.len() < STATIC_KEY_CACHE_LIMIT {
+            map.insert(cache_key, key.clone());
+        }
+    }
+    Ok(key)
 }
 
 /// HKDF-SHA256 expansion used by both key derivations. Kept as a separate

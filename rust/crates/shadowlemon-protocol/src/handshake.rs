@@ -26,7 +26,7 @@ use shadowlemon_crypto::{
     aead::AeadKey,
     envelope::{HandshakeRequest, HandshakeResponse, STATUS_NO_SUITE},
     hint::write_user_hint,
-    kdf::{derive_early_keys, derive_session_keys_v4, derive_static_key, hash_password},
+    kdf::{derive_early_keys, derive_session_keys_v4, derive_static_key, hash_password, StaticKey},
     kex::EphemeralKeyPair,
     suite::Suite,
     CryptoError, WireNonce, DEFAULT_PROTOCOL_VERSION, HANDSHAKE_REQUEST_FIXED_LEN,
@@ -341,6 +341,9 @@ pub fn build_registry(
 pub struct ClientHandshake {
     username: String,
     credential: [u8; 32],
+    /// PBKDF2 result derived once at construction and reused by `early_keys`;
+    /// deriving it per connection (and twice more per handshake) is pure waste.
+    static_key: StaticKey,
     suites: Vec<Suite>,
     session_id: u32,
     transport: HandshakeTransport,
@@ -386,6 +389,7 @@ impl ClientHandshake {
         Ok(Self {
             username,
             credential,
+            static_key,
             suites,
             session_id,
             transport,
@@ -443,8 +447,8 @@ impl ClientHandshake {
     /// before any X25519 exchange completes. Early data therefore has **no
     /// forward secrecy**; only the post-handshake data keys do.
     pub fn early_keys(&self) -> Result<(AeadKey, AeadKey), HandshakeError> {
-        let static_key = derive_static_key(&self.username, &self.credential, self.suites[0])?;
-        let (c2s, s2c) = derive_early_keys(static_key.as_slice(), self.session_id, self.suites[0])?;
+        let (c2s, s2c) =
+            derive_early_keys(self.static_key.as_slice(), self.session_id, self.suites[0])?;
         Ok((
             AeadKey::new(self.suites[0], c2s.as_slice())?,
             AeadKey::new(self.suites[0], s2c.as_slice())?,
