@@ -17,7 +17,7 @@ use crate::{
     error::{ConfigError, Result},
     schema::{
         is_valid_port, parse_port_range, ClientConfig, ClientProfile, MultiplexingConfig,
-        PortBinding, ServerEndpoint, TrafficPattern, User,
+        PortBinding, ServerEndpoint, User,
     },
     validate::Validate,
 };
@@ -118,11 +118,6 @@ fn export_profile_urls(profile: &ClientProfile) -> Result<Vec<String>> {
         }
         common.push(("cipher-suites".into(), names.join(",")));
     }
-    if let Some(pattern) = &profile.traffic_pattern {
-        let bytes = serde_json::to_vec(pattern)?;
-        common.push(("traffic-pattern".into(), STANDARD.encode(bytes)));
-    }
-
     if profile.servers.is_empty() {
         return Err(invalid(format!("profile '{profile_name}' has no servers")));
     }
@@ -308,14 +303,6 @@ pub fn import_simple_url(url: &str) -> Result<ClientConfig> {
         }
         None => None,
     };
-    let traffic_pattern = match find("traffic-pattern") {
-        Some(raw) => {
-            let bytes = STANDARD.decode(raw)?;
-            Some(serde_json::from_slice::<TrafficPattern>(&bytes)?)
-        }
-        None => None,
-    };
-
     let host_text = match host {
         Host::Ipv4(addr) => addr.to_string(),
         Host::Ipv6(addr) => addr.to_string(),
@@ -344,7 +331,6 @@ pub fn import_simple_url(url: &str) -> Result<ClientConfig> {
         mtu,
         multiplexing,
         handshake_mode,
-        traffic_pattern,
         cipher_suites,
         ..Default::default()
     };

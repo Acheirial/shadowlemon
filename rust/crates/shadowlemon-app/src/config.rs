@@ -15,7 +15,7 @@ use std::{
 use crate::AppError;
 use shadowlemon_config::{
     config_dir, config_suite_to_wire, load_json, CipherSuite, ClientConfig, ClientProfile, Egress,
-    LoggingLevel, MultiplexingLevel, ServerConfig, TrafficPattern,
+    LoggingLevel, MultiplexingLevel, ServerConfig,
 };
 use shadowlemon_crypto::suite::Suite;
 use shadowlemon_protocol::serveruser::User;
@@ -171,40 +171,6 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-fn traffic_pattern(pattern: Option<&TrafficPattern>) -> (NoncePattern, NoncePatternConfig) {
-    let Some(pattern) = pattern else {
-        return (NoncePattern::Random, NoncePatternConfig::default());
-    };
-    let Some(nonce) = pattern.nonce.as_ref() else {
-        return (NoncePattern::Random, NoncePatternConfig::default());
-    };
-    let strategy = match &nonce.nonce_type {
-        shadowlemon_config::NonceType::NonceTypePrintable => NoncePattern::Printable,
-        shadowlemon_config::NonceType::NonceTypePrintableSubset => NoncePattern::PrintableSubset,
-        shadowlemon_config::NonceType::NonceTypeFixed => NoncePattern::Fixed(
-            nonce
-                .custom_hex_strings
-                .iter()
-                .filter_map(|text| decode_hex(text))
-                .filter(|prefix| prefix.len() <= 12)
-                .collect(),
-        ),
-        _ => NoncePattern::Random,
-    };
-    let min_len = usize::try_from(nonce.min_len.unwrap_or(6))
-        .unwrap_or(6)
-        .min(12);
-    let max_len = usize::try_from(nonce.max_len.unwrap_or(12))
-        .unwrap_or(12)
-        .min(12);
-    let config = NoncePatternConfig {
-        min_len: min_len.min(max_len),
-        max_len,
-        apply_to_all_udp_packets: nonce.apply_to_all_udp_packet,
-    };
-    (strategy, config)
-}
-
 /// Translate an active client profile into the real handshake driver config.
 pub fn client_driver_config(profile: &ClientProfile) -> Result<RealClientConfig, AppError> {
     let user = profile
@@ -231,7 +197,9 @@ pub fn client_driver_config(profile: &ClientProfile) -> Result<RealClientConfig,
         ));
     };
     let suites = wire_suites(&profile.cipher_suites, Some(Suite::XChaCha20Poly1305))?;
-    let (nonce, nonce_config) = traffic_pattern(profile.traffic_pattern.as_ref());
+    // All wire nonces are uniformly random in the real driver; no traffic
+    // pattern is applied (see docs/traffic-pattern.md).
+    let (nonce, nonce_config) = (NoncePattern::Random, NoncePatternConfig::default());
     let mtu = u16::try_from(profile.mtu.unwrap_or(1400))
         .map_err(|_| AppError::Config("profile MTU is out of range".to_owned()))?;
     let handshake_timeout = shadowlemon_protocol::handshake::HANDSHAKE_TIMEOUT;
@@ -308,7 +276,7 @@ pub fn server_driver_config(config: &ServerConfig) -> Result<RealServerConfig, A
         .map_err(|error| AppError::Config(format!("invalid server user {name:?}: {error}")))?;
         users.push(user);
     }
-    let (nonce, nonce_config) = traffic_pattern(config.traffic_pattern.as_ref());
+    let (nonce, nonce_config) = (NoncePattern::Random, NoncePatternConfig::default());
     let mtu = u16::try_from(config.mtu.unwrap_or(1400))
         .map_err(|_| AppError::Config("server MTU is out of range".to_owned()))?;
     let driver = RealServerConfig {

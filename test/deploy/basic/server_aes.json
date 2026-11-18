@@ -31,10 +31,5 @@
     "advancedSettings": {
         "userHintIsMandatory": true
     },
-    "loggingLevel": "DEBUG",
-    "trafficPattern": {
-        "lowEntropy": {
-            "mode": "LOW_ENTROPY_MODE_56"
-        }
-    }
+    "loggingLevel": "DEBUG"
 }

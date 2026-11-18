@@ -300,7 +300,7 @@ shadowlemon://<base64 编码的客户端配置>
 使用指令 `shadowlemon client export config simple` 生成人类可读的简单分享链接。例如：
 
 ```
-shadowlemons://user1:password1@1.2.3.4?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400&multiplexing=MULTIPLEXING_HIGH&port=6666&port=10000-10001&port=10002&port=10003&profile=default&protocol=TCP&protocol=TCP&protocol=UDP&protocol=UDP&traffic-pattern=CCoQARoECAEQCiIYCAMQASoIMDAwMTAyMDMqCDA0MDUwNjA3
+shadowlemons://user1:password1@1.2.3.4?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400&multiplexing=MULTIPLEXING_HIGH&port=6666&port=10000-10001&port=10002&port=10003&profile=default&protocol=TCP&protocol=TCP&protocol=UDP&protocol=UDP
 ```
 
 简单分享链接的格式如下：
@@ -318,11 +318,10 @@ shadowlemons://user1:password1@1.2.3.4?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400
 - `multiplexing`
 - `handshake-mode`
 - `cipher-suites`
-- `traffic-pattern`
 - `port`
 - `protocol`
 
-其中 `profile` 必须出现一次，`mtu`，`multiplexing`，`handshake-mode`，`cipher-suites` 以及 `traffic-pattern` 最多出现一次，`port` 和 `protocol` 可以出现多次，且他们出现的次数必须相同，以便将同一位置上的 `port` 和 `protocol` 联系起来。另外 `port` 也可以用来指定一段连续的端口。`traffic-pattern` 的值使用 base64 编码的确定性二进制配置格式，与[流量模式](./traffic-pattern.md)文档中描述的字段一一对应。
+其中 `profile` 必须出现一次，`mtu`、`multiplexing`、`handshake-mode` 以及 `cipher-suites` 最多出现一次，`port` 和 `protocol` 可以出现多次，且它们出现的次数必须相同，以便将同一位置上的 `port` 和 `protocol` 联系起来。另外 `port` 也可以用来指定一段连续的端口。
 
 `cipher-suites` 的值是用逗号分隔的套件枚举名列表，顺序即客户端的偏好顺序，例如 `cipher-suites=CIPHER_SUITE_XCHACHA20_POLY1305,CIPHER_SUITE_AES_256_GCM`。如果 profile 设置了 `cipherSuites`，`shadowlemon client export config simple` 生成的链接中就会包含该参数；链接中省略该参数等同于未设置 `cipherSuites`，即客户端只使用 `CIPHER_SUITE_XCHACHA20_POLY1305`。如果列表中含有无法识别的套件名，或者其中含有 `CIPHER_SUITE_UNSPECIFIED`，`shadowlemon client import config <URL>` 会报错。
 
@@ -362,24 +361,8 @@ shadowlemons://user1:password1@1.2.3.4?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400
     "multiplexing":  {
         "level":  "MULTIPLEXING_HIGH"
     },
-    "handshakeMode":  "HANDSHAKE_NO_WAIT",
-    "trafficPattern":  {
-        "seed":  42,
-        "unlockAll":  true,
-        "tcpFragment":  {
-            "enable":  true,
-            "maxSleepMs":  10
-        },
-        "nonce":  {
-            "type":  "NONCE_TYPE_FIXED",
-            "applyToAllUDPPacket":  true,
-            "customHexStrings":  [
-                "00010203",
-                "04050607"
-            ]
-        }
-    }
+    "handshakeMode":  "HANDSHAKE_NO_WAIT"
 }
 ```
 
-简单分享链接只包含服务器、用户与流量模式等最少的必要信息，不含有 `socks5Port` 等本机配置。因此，在全新的设备上导入简单分享链接会失败；如需完整复制配置，请使用标准分享链接。
+简单分享链接只包含服务器、用户等最少的必要信息，不含 `socks5Port` 等本机配置。因此，在全新的设备上导入简单分享链接会失败；如需完整复制配置，请使用标准分享链接。

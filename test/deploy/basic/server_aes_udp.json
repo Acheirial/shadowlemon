@@ -32,10 +32,5 @@
         "userHintIsMandatory": true
     },
     "loggingLevel": "DEBUG",
-    "mtu": 1400,
-    "trafficPattern": {
-        "lowEntropy": {
-            "mode": "LOW_ENTROPY_MODE_56"
-        }
-    }
+    "mtu": 1400
 }

@@ -33,7 +33,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -452,7 +452,6 @@ struct ClientMuxInner {
     endpoints: Vec<Endpoint>,
     handshake: Box<dyn ClientHandshake>,
     upstream: Mutex<Option<Arc<dyn ProxyDialer>>>,
-    next_session: AtomicU32,
     next_endpoint: AtomicUsize,
     active: AtomicUsize,
     stopped: AtomicBool,
@@ -493,7 +492,6 @@ impl ClientMux {
                 endpoints,
                 handshake,
                 upstream: Mutex::new(None),
-                next_session: AtomicU32::new(1),
                 next_endpoint: AtomicUsize::new(0),
                 active: AtomicUsize::new(0),
                 stopped: AtomicBool::new(false),
@@ -537,12 +535,17 @@ impl ClientMux {
         self.inner.stopped.load(Ordering::Relaxed)
     }
 
-    /// Allocate a non-zero session ID.
+    /// Allocate a non-zero, unpredictable session ID.
+    ///
+    /// Sequential IDs are a stable traffic fingerprint: on the UDP path the
+    /// session ID is visible in the routing envelope, and even on TCP it is
+    /// carried in encrypted metadata that an observer can correlate across
+    /// packet lengths and timing. Draw a random 32-bit value instead, retrying
+    /// on the reserved value 0 and on a rare collision with a live session.
     pub fn allocate_session_id(&self) -> UnderlayResult<u32> {
-        // Skip the reserved value 0; wrap at most once to avoid spinning.
-        for _ in 0..2 {
-            let id = self.inner.next_session.fetch_add(1, Ordering::Relaxed);
-            if id != 0 {
+        for _ in 0..8 {
+            let id = rand::random::<u32>();
+            if id != 0 && !self.inner.sessions.contains_key(&id) {
                 return Ok(id);
             }
         }

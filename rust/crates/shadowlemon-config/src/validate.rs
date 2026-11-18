@@ -7,12 +7,11 @@
 use std::{collections::HashSet, net::IpAddr, str::FromStr};
 
 use crate::{
-    enums::{CipherSuite, EgressAction, KnownEnum, LowEntropyMode},
+    enums::{CipherSuite, EgressAction, KnownEnum},
     error::{ConfigError, Result},
     schema::{
         is_valid_port, parse_port_range, Auth, ClientConfig, ClientDialer, ClientProfile, Egress,
-        EgressRule, NoncePattern, PortBinding, ServerConfig, ServerEndpoint, TrafficPattern, User,
-        DNS,
+        EgressRule, PortBinding, ServerConfig, ServerEndpoint, User,
     },
 };
 
@@ -173,79 +172,6 @@ fn validate_cipher_suites(suites: &[CipherSuite], path: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_nonce(nonce: &NoncePattern, path: &str) -> Result<()> {
-    check_enum(&nonce.nonce_type, &format!("{path}.type"))?;
-    if let Some(max_len) = nonce.max_len {
-        if !(0..=12).contains(&max_len) {
-            return Err(invalid(
-                format!("{path}.maxLen"),
-                "nonce maxLen must be in the range 0..=12",
-            ));
-        }
-    }
-    for (i, hex) in nonce.custom_hex_strings.iter().enumerate() {
-        check_hex(hex, 12, &format!("{path}.customHexStrings[{i}]"))?;
-    }
-    Ok(())
-}
-
-impl Validate for TrafficPattern {
-    fn validate(&self) -> Result<()> {
-        self.validate_at("trafficPattern")
-    }
-}
-
-impl TrafficPattern {
-    /// Validate with a custom field path prefix (used by client/server configs).
-    pub fn validate_at(&self, path: &str) -> Result<()> {
-        if let Some(tcp) = &self.tcp_fragment {
-            if let Some(ms) = tcp.max_sleep_ms {
-                if !(0..=100).contains(&ms) {
-                    return Err(invalid(
-                        format!("{path}.tcpFragment.maxSleepMs"),
-                        "tcpFragment.maxSleepMs must be in the range 0..=100",
-                    ));
-                }
-            }
-        }
-        if let Some(nonce) = &self.nonce {
-            validate_nonce(nonce, &format!("{path}.nonce"))?;
-        }
-        if let Some(padding) = &self.padding {
-            if let Some(len) = padding.max_middle_padding_len {
-                if !(0..=255).contains(&len) {
-                    return Err(invalid(
-                        format!("{path}.padding.maxMiddlePaddingLen"),
-                        "padding length must be in the range 0..=255",
-                    ));
-                }
-            }
-            if let Some(len) = padding.max_end_padding_len {
-                if !(0..=255).contains(&len) {
-                    return Err(invalid(
-                        format!("{path}.padding.maxEndPaddingLen"),
-                        "padding length must be in the range 0..=255",
-                    ));
-                }
-            }
-        }
-        if let Some(low) = &self.low_entropy {
-            check_enum(&low.mode, &format!("{path}.lowEntropy.mode"))?;
-            check_enum(
-                &low.mask_rotation,
-                &format!("{path}.lowEntropy.maskRotation"),
-            )?;
-            if low.mode != LowEntropyMode::Off && !cfg!(feature = "low-entropy") {
-                return Err(ConfigError::FeatureDisabled {
-                    path: format!("{path}.lowEntropy.mode"),
-                    feature: "low-entropy",
-                });
-            }
-        }
-        Ok(())
-    }
-}
-
 impl Validate for ClientProfile {
     fn validate(&self) -> Result<()> {
         self.validate_at("profiles[0]")
@@ -284,9 +210,6 @@ impl ClientProfile {
         }
         if let Some(handshake) = &self.handshake_mode {
             check_enum(handshake, &format!("{path}.handshakeMode"))?;
-        }
-        if let Some(pattern) = &self.traffic_pattern {
-            pattern.validate_at(&format!("{path}.trafficPattern"))?;
         }
         if let Some(dialer) = &self.dialer {
             validate_dialer(dialer, &format!("{path}.dialer"))?;
@@ -425,19 +348,6 @@ fn validate_egress_rule(rule: &EgressRule, path: &str, proxy_names: &HashSet<&st
     Ok(())
 }
 
-fn validate_dns(dns: &DNS, path: &str) -> Result<()> {
-    check_enum(&dns.dual_stack, &format!("{path}.dualStack"))?;
-    for (domain, ip) in &dns.hosts {
-        if ip.parse::<IpAddr>().is_err() {
-            return Err(invalid(
-                format!("{path}.hosts.{domain}"),
-                format!("'{ip}' is not a valid IP address"),
-            ));
-        }
-    }
-    Ok(())
-}
-
 impl Validate for ServerConfig {
     fn validate(&self) -> Result<()> {
         check_enum(&self.logging_level, "loggingLevel")?;
@@ -474,12 +384,6 @@ impl Validate for ServerConfig {
         if let Some(egress) = &self.egress {
             validate_egress(egress, "egress")?;
         }
-        if let Some(dns) = &self.dns {
-            validate_dns(dns, "dns")?;
-        }
-        if let Some(pattern) = &self.traffic_pattern {
-            pattern.validate_at("trafficPattern")?;
-        }
         validate_cipher_suites(&self.cipher_suites, "cipherSuites")?;
         Ok(())
     }
@@ -489,11 +393,8 @@ impl Validate for ServerConfig {
 mod tests {
     use super::*;
     use crate::{
-        enums::{EgressAction, LowEntropyMaskRotation, LowEntropyMode, ProxyProtocol},
-        schema::{
-            Egress, EgressProxy, EgressRule, LowEntropyPattern, NoncePattern, PaddingPattern,
-            TCPFragment,
-        },
+        enums::{EgressAction, ProxyProtocol},
+        schema::{Egress, EgressProxy, EgressRule},
     };
 
     fn client() -> ClientConfig {
@@ -558,55 +459,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_traffic_pattern_violations() {
-        let mut cfg = client();
-        let pattern = TrafficPattern {
-            tcp_fragment: Some(TCPFragment {
-                enable: Some(true),
-                max_sleep_ms: Some(101),
-            }),
-            ..Default::default()
-        };
-        cfg.profiles[0].traffic_pattern = Some(pattern);
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("tcpFragment.maxSleepMs"), "{err}");
-
-        let mut cfg = client();
-        cfg.profiles[0].traffic_pattern = Some(TrafficPattern {
-            nonce: Some(NoncePattern {
-                max_len: Some(13),
-                custom_hex_strings: vec!["000102030405060708090a0b0c".into()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("nonce.maxLen"), "{err}");
-
-        let mut cfg = client();
-        cfg.profiles[0].traffic_pattern = Some(TrafficPattern {
-            nonce: Some(NoncePattern {
-                custom_hex_strings: vec!["00ff1".into()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        assert!(cfg.validate().is_err());
-
-        let mut cfg = client();
-        cfg.profiles[0].traffic_pattern = Some(TrafficPattern {
-            padding: Some(PaddingPattern {
-                max_middle_padding_len: Some(256),
-                max_end_padding_len: None,
-            }),
-            ..Default::default()
-        });
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_bad_egress_rule_and_dns() {
-        let mut cfg = ServerConfig {
+    fn rejects_bad_egress_rule() {
+        let cfg = ServerConfig {
             egress: Some(Egress {
                 proxies: vec![EgressProxy {
                     name: Some("p".into()),
@@ -625,32 +479,6 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("proxyNames[0]"), "{err}");
-
-        cfg.egress = None;
-        cfg.dns = Some(DNS {
-            hosts: [("example.com".into(), "not-an-ip".into())].into(),
-            ..Default::default()
-        });
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("dns.hosts.example.com"), "{err}");
-    }
-
-    #[test]
-    fn low_entropy_requires_feature() {
-        let mut cfg = client();
-        cfg.profiles[0].traffic_pattern = Some(TrafficPattern {
-            low_entropy: Some(LowEntropyPattern {
-                mode: LowEntropyMode::Mode32,
-                mask_rotation: LowEntropyMaskRotation::RotateLeft3,
-            }),
-            ..Default::default()
-        });
-        if cfg!(feature = "low-entropy") {
-            cfg.validate().unwrap();
-        } else {
-            let err = cfg.validate().unwrap_err().to_string();
-            assert!(err.contains("low-entropy"), "{err}");
-        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ OpenWrt 设备应优先使用 **musl 静态链接** 的 Rust 二进制，以避�
 | ARMv7 | `armv7-unknown-linux-musleabihf` | Tier 2，可用 `cross` 构建 |
 | MIPS / MIPS64 | `mipsel-unknown-linux-musl` / `mips-unknown-linux-musl` | **Tier 3**，见下方注意事项 |
 
-构建时使用 `embedded` profile 与同名 feature，它们会裁剪 egress / DNS 递归 / 低熵兼容 / 详尽日志，并使用 `opt-level = "z"`、fat LTO、`panic = "abort"` 与去除符号以尽量减小体积：
+构建时使用 `embedded` profile 与同名 feature，它们会裁剪 egress 与详尽日志，并使用 `opt-level = "z"`、fat LTO、`panic = "abort"` 与去除符号以尽量减小体积：
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"

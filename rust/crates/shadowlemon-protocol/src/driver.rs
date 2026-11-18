@@ -93,7 +93,7 @@ use crate::{
     serveruser::{Registry, SourceKey, User},
     session::{Direction, Session, SessionConfig, TransportMode},
     stream::TcpSessionStream,
-    underlay::{IpFamily, MtuBudget, Underlay},
+    underlay::{IpFamily, MtuBudget, Underlay, MAX_PREFIX_PADDING, MAX_SUFFIX_PADDING},
     underlay_packet::PacketConfig,
     underlay_stream::{StreamConfig, StreamUnderlay},
 };
@@ -106,7 +106,9 @@ const UDP_KIND_HANDSHAKE_RESPONSE: u8 = 2;
 const UDP_KIND_SESSION_DATA: u8 = 3;
 /// Routing envelope: encrypted session reply/ACK.
 const UDP_KIND_SESSION_REPLY: u8 = 4;
-/// `[kind][session id]` prefix length of the UDP routing envelope.
+/// `[obfuscated kind][session id]` prefix length of the UDP routing envelope.
+/// The kind byte is masked with a deterministic mix of the random session ID
+/// so the prefix has no fixed, signature-matchable bytes.
 const UDP_ENVELOPE_LEN: usize = 5;
 /// `[message id][fragment number][fragment count]` application prefix.
 const APP_FRAGMENT_HEADER_LEN: usize = 6;
@@ -459,7 +461,7 @@ impl mux::ClientHandshake for RealClientHandshake {
                 true,
             )
             .map_err(io_err)?
-            .payload_capacity(0, 0)
+            .payload_capacity(MAX_PREFIX_PADDING, MAX_SUFFIX_PADDING)
             .saturating_sub(APP_FRAGMENT_HEADER_LEN);
             let handle = Arc::new(UdpSessionHandle {
                 session_id,
@@ -772,7 +774,7 @@ impl mux::ServerHandshake for RealServerHandshake {
                                     true,
                                 )
                                 .map_err(io_err)?
-                                .payload_capacity(0, 0)
+                                .payload_capacity(MAX_PREFIX_PADDING, MAX_SUFFIX_PADDING)
                                 .saturating_sub(APP_FRAGMENT_HEADER_LEN),
                             ));
                             self.udp_sessions
@@ -840,9 +842,23 @@ fn drain_output(session: &mut Session) -> Vec<Vec<u8>> {
     std::iter::from_fn(|| session.poll_output()).collect()
 }
 
+/// Mix a random session ID into a single byte. This is the MurmurHash3 finalizer
+/// resized to 8 bits; it is an obfuscation against fixed-byte DPI signatures,
+/// not encryption — a protocol-aware observer can still invert it. Real
+/// confidentiality of the routing metadata requires a negotiated secret key.
+fn envelope_mask(session_id: u32) -> u8 {
+    let mut x = session_id;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846c_a68b);
+    x ^= x >> 16;
+    (x & 0xff) as u8
+}
+
 fn wrap_udp(kind: u8, session_id: u32, frame: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(UDP_ENVELOPE_LEN + frame.len());
-    out.push(kind);
+    out.push(kind ^ envelope_mask(session_id));
     out.extend_from_slice(&session_id.to_be_bytes());
     out.extend_from_slice(frame);
     out
@@ -853,7 +869,13 @@ fn unwrap_udp(datagram: &[u8]) -> Option<(u8, u32, &[u8])> {
         return None;
     }
     let id = u32::from_be_bytes(datagram[1..5].try_into().ok()?);
-    Some((datagram[0], id, &datagram[UDP_ENVELOPE_LEN..]))
+    let kind = datagram[0] ^ envelope_mask(id);
+    // Reject packets whose masked kind is not one of the four legal values;
+    // this also drops unrelated UDP noise before it reaches the handshake.
+    if !(UDP_KIND_HANDSHAKE_REQUEST..=UDP_KIND_SESSION_REPLY).contains(&kind) {
+        return None;
+    }
+    Some((kind, id, &datagram[UDP_ENVELOPE_LEN..]))
 }
 
 fn split_app_fragment(chunk: &[u8]) -> Option<(u32, u8, u8, Vec<u8>)> {
@@ -1318,6 +1340,22 @@ mod tests {
             Some((UDP_KIND_SESSION_DATA, 42, &b"encrypted frame"[..]))
         );
         assert!(unwrap_udp(&frame[..UDP_ENVELOPE_LEN - 1]).is_none());
+    }
+
+    #[test]
+    fn udp_envelope_kind_byte_is_obfuscated_and_varies_with_session() {
+        // A passive observer must not find the old fixed 1/2/3/4 prefix.
+        let mut first_bytes = std::collections::HashSet::new();
+        for id in [1u32, 2, 3, 42, 10_000, u32::MAX] {
+            let frame = wrap_udp(UDP_KIND_SESSION_DATA, id, b"x");
+            assert_ne!(frame[0], UDP_KIND_SESSION_DATA);
+            first_bytes.insert(frame[0]);
+        }
+        assert!(first_bytes.len() > 1);
+        // Garbage is rejected before reaching the handshake dispatcher.
+        let mut garbage = wrap_udp(UDP_KIND_SESSION_DATA, 7, b"x");
+        garbage[0] ^= 0xff;
+        assert!(unwrap_udp(&garbage).is_none());
     }
 
     #[test]

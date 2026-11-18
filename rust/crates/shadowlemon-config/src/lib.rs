@@ -10,14 +10,17 @@
 //!
 //! Unrecognized JSON fields are ignored (the crate does **not** use
 //! `deny_unknown_fields`). This lets older configs be loaded smoothly; fields
-//! deleted in V0.2 (`rpcPort`, `quotas`, `allowLocalDestination`, ...) are
-//! simply dropped when the config is re-serialized.
+//! deleted in V0.2 (`rpcPort`, `quotas`, `allowLocalDestination`,
+//! `trafficPattern`, `dns`, ...) are simply dropped when the config is
+//! re-serialized. In particular, the V0.2 traffic-pattern knobs were inert:
+//! they were parsed but never reached the data path, so they were removed
+//! rather than carried forward as misleading options.
 //!
 //! # Determinism
 //!
-//! `DNS::hosts` is a `BTreeMap`, and struct field order is fixed, so
-//! serialization is stable. That makes the JSON bytes suitable as the
-//! deterministic binary payload of `shadowlemon://` URLs.
+//! Struct field order is fixed, so serialization is stable. That makes the
+//! JSON bytes suitable as the deterministic binary payload of
+//! `shadowlemon://` URLs.
 
 #![forbid(unsafe_code)]
 
@@ -40,9 +43,8 @@ pub use ops::{
 };
 pub use schema::{
     is_valid_port, parse_port_range, Auth, ClientConfig, ClientDialer, ClientProfile, Egress,
-    EgressProxy, EgressRule, LowEntropyPattern, MultiplexingConfig, NoncePattern, PaddingPattern,
-    PortBinding, ServerAdvancedSettings, ServerConfig, ServerEndpoint, TCPFragment, TrafficPattern,
-    User, DNS,
+    EgressProxy, EgressRule, MultiplexingConfig, PortBinding, ServerAdvancedSettings, ServerConfig,
+    ServerEndpoint, User,
 };
 pub use url::{
     export_full_url, export_simple_urls, import_full_url, import_simple_url, import_url,

@@ -180,7 +180,7 @@ shadowlemon client apply config <client_config.json>
 | MTU 不匹配导致分片 | `ping -M do -s 1372 <server>`（Linux） | 在两端将 `mtu` 设为相同的值（取值范围 1280 到 1500，例如 1280）后再次测试。 |
 | 多路复用过于激进 | 调试日志显示短时间内建立大量连接 | 将 `multiplexing` 的 `level` 降为 `MULTIPLEXING_LOW` 或 `MULTIPLEXING_MIDDLE`。 |
 | 服务器负载过高 | `top` / `uptime` 查看 CPU 与负载 | 减少单机用户数量，或增加服务器数量分摊流量。 |
-| 加密与填充开销 | 启用了低熵模式或较大的填充长度 | 参见[流量模式](./traffic-pattern.md)，适当降低填充与低熵模式的强度。 |
+| 随机填充与加密开销 | 每条数据帧附带逐帧随机的 0–32 字节填充 | 填充是协议内置的抗指纹措施，不可配置；若带宽敏感，可适度降低两端 `mtu`，或使用 `embedded` 构建。详见[流量模式](./traffic-pattern.md)。 |
 
 ### 症状：客户端无法启动
 

@@ -33,6 +33,7 @@ use crate::{
     congestion::{retransmission_timeout, Cubic, RttStats, MAX_CWND, MIN_CWND},
     handshake::AeadCipher,
     replay::{ReplayCache, ReplayDecision, ReplayDomain, SourceTag},
+    underlay::{MAX_PREFIX_PADDING, MAX_SUFFIX_PADDING},
 };
 
 /// Session identifier; zero is reserved and must never be used.
@@ -904,9 +905,22 @@ impl Session {
             .min(u16::MAX as u32) as u16
     }
 
+    /// Random-length, random-byte unencrypted padding. A constant padding
+    /// length would itself be a fingerprint, so the length is redrawn for every
+    /// frame — including empty ACKs and close frames.
+    fn random_padding(max: usize) -> Vec<u8> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let len = rand::random_range(0..=max);
+        (0..len).map(|_| rand::random::<u8>()).collect()
+    }
+
     fn encode_data(&mut self, payload: &[u8], fragment: u8) -> Result<Vec<u8>, SessionError> {
         let seq = self.next_send;
         self.next_send = self.next_send.wrapping_add(1);
+        let prefix = Self::random_padding(MAX_PREFIX_PADDING);
+        let suffix = Self::random_padding(MAX_SUFFIX_PADDING);
         let metadata = shadowlemon_wire::Metadata::data(
             self.direction.data_type(),
             self.id,
@@ -914,17 +928,19 @@ impl Session {
             self.next_recv,
             self.receive_window(),
             fragment,
-            0,
+            u8::try_from(prefix.len()).expect("prefix padding <= 32"),
             u16::try_from(payload.len()).map_err(|_| {
                 SessionError::Configuration("data fragment exceeds 65535 bytes".to_owned())
             })?,
-            0,
+            u8::try_from(suffix.len()).expect("suffix padding <= 32"),
         );
-        self.encode_segment(metadata, payload)
+        self.encode_segment(metadata, payload, prefix, suffix)
     }
 
     fn encode_ack(&mut self) -> Result<(), SessionError> {
         let seq = self.next_send.wrapping_sub(1);
+        let prefix = Self::random_padding(MAX_PREFIX_PADDING);
+        let suffix = Self::random_padding(MAX_SUFFIX_PADDING);
         let metadata = shadowlemon_wire::Metadata::data(
             self.direction.ack_type(),
             self.id,
@@ -932,17 +948,18 @@ impl Session {
             self.next_recv,
             self.receive_window(),
             0,
+            u8::try_from(prefix.len()).expect("prefix padding <= 32"),
             0,
-            0,
-            0,
+            u8::try_from(suffix.len()).expect("suffix padding <= 32"),
         );
-        let frame = self.encode_segment(metadata, &[])?;
+        let frame = self.encode_segment(metadata, &[], prefix, suffix)?;
         self.outgoing.push_back(frame);
         Ok(())
     }
 
     fn encode_control(&mut self, protocol_type: u8, payload: Vec<u8>) -> Result<(), SessionError> {
         let seq = self.next_send.wrapping_sub(1);
+        let suffix = Self::random_padding(MAX_SUFFIX_PADDING);
         let metadata = shadowlemon_wire::Metadata::session(
             protocol_type,
             self.id,
@@ -950,9 +967,9 @@ impl Session {
             u16::try_from(payload.len()).map_err(|_| {
                 SessionError::Configuration("control payload exceeds 65535 bytes".to_owned())
             })?,
-            0,
+            u8::try_from(suffix.len()).expect("suffix padding <= 32"),
         );
-        let frame = self.encode_segment(metadata, &payload)?;
+        let frame = self.encode_segment(metadata, &payload, Vec::new(), suffix)?;
         self.outgoing.push_back(frame);
         Ok(())
     }
@@ -961,6 +978,8 @@ impl Session {
         &mut self,
         metadata: shadowlemon_wire::Metadata,
         payload: &[u8],
+        prefix_padding: Vec<u8>,
+        suffix_padding: Vec<u8>,
     ) -> Result<Vec<u8>, SessionError> {
         let (nonce, include_nonce) = self.send_chain.outgoing_nonce();
         let payload_nonce = if self.mode == TransportMode::Stream {
@@ -968,7 +987,9 @@ impl Session {
         } else {
             shadowlemon_wire::PayloadNonce::UdpFlip
         };
-        let segment = shadowlemon_wire::Segment::new(metadata, nonce, payload.to_vec());
+        let mut segment = shadowlemon_wire::Segment::new(metadata, nonce, payload.to_vec());
+        segment.prefix_padding = prefix_padding;
+        segment.suffix_padding = suffix_padding;
         let options = shadowlemon_wire::EncodeOptions {
             include_nonce,
             payload_nonce,
@@ -1092,6 +1113,21 @@ mod tests {
         let frame = pump_until_outgoing(&mut server, now);
         client.on_frame(&frame, now).unwrap();
         assert_eq!(client.try_recv(), Some(b"world".to_vec()));
+    }
+
+    #[test]
+    fn padding_lengths_are_random_and_bounded() {
+        let mut lengths = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let padding = Session::random_padding(MAX_PREFIX_PADDING);
+            assert!(padding.len() <= MAX_PREFIX_PADDING);
+            lengths.insert(padding.len());
+        }
+        assert!(
+            lengths.len() > 1,
+            "padding length must not be constant (fingerprint)"
+        );
+        assert!(Session::random_padding(0).is_empty());
     }
 
     #[test]

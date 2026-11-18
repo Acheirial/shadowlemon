@@ -38,7 +38,10 @@ use shadowlemon_wire::{
 use thiserror::Error;
 use tracing::debug;
 
-use crate::serveruser::{Decryption, Registry, SourceKey, User, UserDecryptor};
+use crate::{
+    serveruser::{Decryption, Registry, SourceKey, User, UserDecryptor},
+    underlay::MAX_SUFFIX_PADDING,
+};
 
 /// The client waits at most ten seconds for the handshake response.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -472,14 +475,24 @@ impl ClientHandshake {
         let attached = piggyback.len().min(self.piggyback_capacity());
         payload.extend_from_slice(&piggyback[..attached]);
 
+        // A random-length suffix breaks the fixed 140/150-byte handshake frame
+        // fingerprint. The server reads the variable part from the decrypted
+        // metadata lengths, so no fixed-size reader depends on this.
+        let suffix: Vec<u8> = if MAX_SUFFIX_PADDING == 0 {
+            Vec::new()
+        } else {
+            let len = rand::random_range(0..=MAX_SUFFIX_PADDING);
+            (0..len).map(|_| rand::random::<u8>()).collect()
+        };
         let metadata = Metadata::session(
             TYPE_OPEN_SESSION_REQUEST,
             self.session_id,
             0,
             payload_len(&payload)?,
-            0,
+            u8::try_from(suffix.len()).expect("suffix padding <= 32"),
         );
-        let segment = shadowlemon_wire::Segment::new(metadata, self.request_nonce, payload);
+        let mut segment = shadowlemon_wire::Segment::new(metadata, self.request_nonce, payload);
+        segment.suffix_padding = suffix;
         let options = EncodeOptions {
             include_nonce: true,
             payload_nonce: self.transport.payload_nonce(),
@@ -1091,10 +1104,8 @@ mod tests {
         .unwrap();
 
         let request = client.build_request(b"").unwrap();
-        assert_eq!(
-            request.len(),
-            WIRE_NONCE_LEN + META_BLOCK_LEN + 51 + 1 /* suite */ + AEAD_TAG_LEN
-        );
+        let base = WIRE_NONCE_LEN + META_BLOCK_LEN + 51 + 1 /* suite */ + AEAD_TAG_LEN;
+        assert!((base..=base + MAX_SUFFIX_PADDING).contains(&request.len()));
         let response = match server.accept(&request).unwrap() {
             ServerHandshakeResult::Established { response, .. } => response,
             _ => panic!("unexpected result"),

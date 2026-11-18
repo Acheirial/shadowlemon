@@ -52,8 +52,5 @@
                 "action": "DIRECT"
             }
         ]
-    },
-    "dns": {
-        "dualStack": "PREFER_IPv4"
     }
 }

@@ -32,13 +32,6 @@
             "mtu": 1400,
             "multiplexing": {
                 "level": "MULTIPLEXING_HIGH"
-            },
-            "trafficPattern": {
-                "unlockAll": true,
-                "tcpFragment":  {
-                    "enable":  true,
-                    "maxSleepMs":  10
-                }
             }
         }
     ],

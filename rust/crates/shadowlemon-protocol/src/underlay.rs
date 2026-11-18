@@ -46,6 +46,15 @@ pub const MAX_MTU: u16 = 1500;
 pub const IPV4_OVERHEAD: usize = 28;
 /// IPv6 header (40) + UDP header (8).
 pub const IPV6_OVERHEAD: usize = 48;
+/// Plaintext routing envelope prepended by the driver to every UDP datagram.
+/// It must be reserved from the MTU budget so the IP packet never exceeds the
+/// configured L3 MTU.
+pub const UDP_ROUTING_ENVELOPE_LEN: usize = 5;
+/// Maximum random prefix padding added to a frame. Combined with the suffix
+/// budget this breaks the deterministic frame-length fingerprint.
+pub const MAX_PREFIX_PADDING: usize = 32;
+/// Maximum random suffix padding added to a frame.
+pub const MAX_SUFFIX_PADDING: usize = 32;
 /// Largest possible UDP datagram payload.
 pub const MAX_DATAGRAM_LEN: usize = 65_535;
 /// A traffic pattern may only rewrite the first 12 nonce bytes so that the
@@ -517,7 +526,7 @@ pub fn validate_l3_mtu(mtu: u16) -> UnderlayResult<()> {
 /// Maximum UDP payload (encrypted segment) size for an L3 MTU and family.
 pub fn udp_payload_budget(mtu: u16, family: IpFamily) -> UnderlayResult<usize> {
     validate_l3_mtu(mtu)?;
-    Ok(usize::from(mtu) - family.header_overhead())
+    Ok(usize::from(mtu) - family.header_overhead() - UDP_ROUTING_ENVELOPE_LEN)
 }
 
 /// Turn an L3 MTU into a per-fragment application-payload capacity.
@@ -815,8 +824,8 @@ mod tests {
 
     #[test]
     fn mtu_budget_matches_spec_headers() {
-        assert_eq!(udp_payload_budget(1400, IpFamily::V4).unwrap(), 1372);
-        assert_eq!(udp_payload_budget(1400, IpFamily::V6).unwrap(), 1352);
+        assert_eq!(udp_payload_budget(1400, IpFamily::V4).unwrap(), 1367);
+        assert_eq!(udp_payload_budget(1400, IpFamily::V6).unwrap(), 1347);
         assert!(validate_l3_mtu(1279).is_err());
         assert!(validate_l3_mtu(1501).is_err());
         validate_l3_mtu(1280).unwrap();
@@ -829,7 +838,7 @@ mod tests {
             vec![0xaa; 100],
         );
         assert!(budget.fits(&segment));
-        assert_eq!(budget.payload_capacity(2, 3), 1372 - 72 - 2 - 3 - 16);
+        assert_eq!(budget.payload_capacity(2, 3), 1367 - 72 - 2 - 3 - 16);
         let big = Segment::new(
             Metadata::data(6, 1, 0, 0, 16, 0, 0, 32768, 0),
             [1u8; WIRE_NONCE_LEN],

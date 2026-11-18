@@ -30,6 +30,8 @@
 | `REPLAY_CACHE_GEN_SIZE` | `65536` | 每代签名表容量 |
 | `REPLAY_CACHE_TTL` | `360` 秒（6 分钟） | 代轮换时间阈值 |
 | `NEGATIVE_HINT_CACHE_TTL` | `10` 秒 | `(hint, sourceIP)` 负缓存有效期 |
+| `MAX_PREFIX_PADDING` / `MAX_SUFFIX_PADDING` | `32` / `32` | 实现层每条数据帧随机前缀/后缀填充上限（见 §10.1） |
+| `UDP_ROUTING_ENVELOPE_LEN` | `5` | UDP 路由明文头长度，已从 MTU 预算中扣除（见 §9） |
 
 记 `‖` 为字节串拼接；记 `byte(x)` 为单字节无符号整数；`u16be` / `u32be` / `u64be` 为大端整数编码。`rotr64(x, n)` 为 64 位循环右移。
 
@@ -295,7 +297,7 @@ s2cKey    = HKDF-SHA256(ikm=shared, salt=salt, info=info_s2c, L=finalSuite.KeyLe
 
 ## 7. 低熵扩展（类型 10/11）
 
-> **Rust 中该扩展是 feature-gated 的，默认关闭（default OFF）**。仅当启用对应编译特性且配置 `trafficPattern.lowEntropy.mode ≠ LOW_ENTROPY_MODE_OFF` 时才会产生/接受类型 10/11 数据段。
+> **Rust 中该扩展是 feature-gated 的，默认关闭（default OFF）**。`shadowlemon-wire` 中保留了类型 10/11 的编解码实现，但配置层已移除 `trafficPattern.lowEntropy` 字段，当前应用**不会**产生或请求低熵数据段；接收端仍可解析合法的低熵帧以兼容未来版本。实际抗指纹措施见 §10.1。
 
 V0.2 对低熵编码做了**简化**（相对 Go V0.1 实现）：保留核心思想（把密文正文按 8 字节块编码、掩码标记数据位、填充位携带逐段随机极性、认证标签不参与变换、`extracted payload length` 记录原文长度），但**去掉步长家族与「由掩码反推步长」的歧义约束**，改为「模式固定步长 + 掩码popcount固定 + 单字节简单旋转」。实现只需少量状态。
 
@@ -491,6 +493,18 @@ sig = FNV1a64(m)
 7. 会话/序列号/流控/填充长度一致性校验；失败 → 丢弃。
 8. 将 `sig` 写入重放缓存（提升到当前代，写入来源标记）。
 9. 提交上层处理。
+
+---
+
+## 10.1 实现的抗指纹加固
+
+以下措施是 V0.2 实现层为削弱被动流量指纹而采取的约定，不改变线格式字段的长度与语义，但要求两端同时升级：
+
+1. **随机会话 ID**：`session ID` 不再从 1 递增分配，而是随机取非零 `u32`（与当前存活会话查重）。UDP 路由头中不再出现递增的 `00 00 00 01` 序列。
+2. **UDP 路由头混淆**：§9 的 5 字节头保留，但 `kind` 字节改为 `kind XOR mix(session ID)`，其中 `mix` 为 32 位 MurmurHash3 finalizer 取低 8 位。这是对**固定字节 DPI 签名**的混淆，不是加密；协议感知的观察者仍可反推 `kind`。
+3. **始终随机填充**：实现层为每条数据帧、ACK、关闭帧以及握手请求生成随机长度的前缀/后缀填充（各 `0..=32` 字节，随机内容）。长度逐帧重抽，避免固定长度指纹；接收端仍按元数据 `prefixLen` / `suffixLen` 读取。握手响应保持固定长度，因为 TCP 读取端依赖该定长约定。
+4. **MTU 预算**：`udp_payload_budget` 在 L3 MTU 中额外扣除 5 字节路由头与最大填充预算，确保 IP 总长不超过配置值。
+5. **配置层清理**：`trafficPattern`（含 nonce / padding / lowEntropy / tcpFragment / seed / unlockAll）与 `dns` 等被解析但从未贯穿到数据面的配置项已从配置 schema 中移除；真实生效的流量相关配置仅为 `mtu`、`multiplexing`、`egress`、`handshakeMode`、`cipherSuites` 与 `userHintIsMandatory`。
 
 ---
 

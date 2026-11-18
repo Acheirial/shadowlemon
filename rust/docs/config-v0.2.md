@@ -1,6 +1,6 @@
 # ShadowLemon V0.2 配置规范（Rust 重写版）
 
-本文描述 ShadowLemon V0.2（Rust 重写）的客户端/服务端配置格式与行为。**JSON 字段名与形状保持与 Go V0.1 一致**，因此现有 `configs/examples/*.json` 可被 Rust 版本直接加载。协议层的破坏性变更（版本 4、移除时间盐、移除 timestamp、低熵简化）**不体现在 JSON 字段名上**——没有新增时间相关字段，也没有需要改名的字段。
+本文描述 ShadowLemon V0.2（Rust 重写）的客户端/服务端配置格式与行为。**JSON 字段名与形状保持与 Go V0.1 一致**，因此现有 `configs/examples/*.json` 可被 Rust 版本直接加载。协议层的破坏性变更（版本 4、移除时间盐、移除 timestamp、低熵简化）**不体现在 JSON 字段名上**——没有新增时间相关字段，也没有需要改名的字段。V0.2 删除了从未接入数据面的 `trafficPattern` 与服务端 `dns`：含这些字段的旧配置仍可加载（未知字段被忽略），但它们不再被解析，也不再影响流量形态。
 
 > 底层数据模型在 Go 中是 protobuf（见 `pkg/appctl/proto/*.proto`），Rust 版本用 **serde** 直接对同样的 JSON 形状做序列化/反序列化。枚举在 JSON 中以**字符串枚举名**表示（例如 `"CIPHER_SUITE_AES_256_GCM"`），而非数字。
 
@@ -61,7 +61,6 @@
 | `mtu` | `int32` | 否 | 实现默认 | L3 MTU，取值 `1280..1500`（UDP egress 用） |
 | `multiplexing` | `MultiplexingConfig` | 否 | 见枚举 | 复用行为 |
 | `handshakeMode` | `HandshakeMode` | 否 | `HANDSHAKE_DEFAULT` | 建连握手模式 |
-| `trafficPattern` | `TrafficPattern` | 否 | 空 | 流量特征微调（含低熵配置） |
 | `dialer` | `ClientDialer` | 否 | 空 | 连接服务端前经过的前置代理 |
 | `cipherSuites` | `CipherSuite[]` | 否 | 空→仅 XChaCha20-Poly1305 | 客户端首选套件（枚举字符串），顺序即偏好 |
 
@@ -94,8 +93,6 @@
 | `loggingLevel` | `LoggingLevel` | 否 | `DEFAULT` | 日志级别 |
 | `mtu` | `int32` | 否 | 实现默认 | L3 MTU，`1280..1500` |
 | `egress` | `Egress` | 否 | 空 | 出口代理与规则 |
-| `dns` | `DNS` | 否 | 空 | 域名解析设置 |
-| `trafficPattern` | `TrafficPattern` | 否 | 空 | 流量特征微调 |
 | `cipherSuites` | `CipherSuite[]` | 否 | 空→接受全部 | 服务端允许/偏好套件 |
 
 ### 4.1 User / Auth
@@ -137,32 +134,6 @@ V0.1 中该消息的两个旧字段 `allowLocalDestination`（字段号 1）与 
 | `action` | `EgressAction` | `PROXY` / `DIRECT` / `REJECT` |
 | `proxyNames` | `string[]` | `action=PROXY` 时必填，引用 EgressProxy.name；多个时随机选择 |
 
-### 4.4 DNS
-
-`DNS`：`dualStack`（DualStack）、`hosts`（`map<string,string>`，静态域名→IP 映射，类似 `/etc/hosts`）。
-
----
-
-## 5. TrafficPattern（客户端与服务端共用）
-
-`TrafficPattern` 各子字段均为可选：
-
-| JSON 字段 | 类型 | 说明 |
-| :-- | :-- | :-- |
-| `seed` | `int32` | 生成隐式流量特征的种子 |
-| `unlockAll` | `bool` | 隐式特征是否使用全部可选项 |
-| `tcpFragment` | `TCPFragment` | TCP 额外分片 |
-| `nonce` | `NoncePattern` | 操纵 nonce 前缀 |
-| `padding` | `PaddingPattern` | 填充行为 |
-| `lowEntropy` | `LowEntropyPattern` | 低熵行为（默认 OFF） |
-
-- `TCPFragment`：`enable`（bool）、`maxSleepMs`（int32，片上睡眠上限，≤100）。
-- `NoncePattern`：`type`（NonceType）、`applyToAllUDPPacket`（bool）、`minLen`（int32）、`maxLen`（int32，≤12）、`customHexStrings`（string[]，每项 ≤12 字节）。`minLen`/`maxLen` 在 `NONCE_TYPE_RANDOM` / `NONCE_TYPE_FIXED` 下忽略。
-- `PaddingPattern`：`maxMiddlePaddingLen`（int32，`0..255`，0 禁用）、`maxEndPaddingLen`（int32，`0..255`，0 禁用）。
-- `LowEntropyPattern`：`mode`（LowEntropyMode）、`maskRotation`（LowEntropyMaskRotation）。**V0.2 低熵在 Rust 中 feature-gated，默认 OFF；编码规则已简化，见 protocol-v0.2.md §7。**
-
-> 安全约束：traffic pattern 可重写的 nonce 前缀**最多 12 字节**（`maxLen ≤ 12`），因为 AES-GCM 使用 `wireNonce[12:24]` 作为 AEAD nonce，前 12 字节被改成确定性值会摧毁 GCM 安全性。
-
 ---
 
 ## 6. 枚举清单
@@ -172,18 +143,12 @@ V0.1 中该消息的两个旧字段 `allowLocalDestination`（字段号 1）与 
 | 枚举 | 合法字符串值 |
 | :-- | :-- |
 | `LoggingLevel` | `DEFAULT`, `FATAL`, `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE` |
-| `DualStack` | `USE_FIRST_IP`, `PREFER_IPv4`, `PREFER_IPv6`, `ONLY_IPv4`, `ONLY_IPv6` |
 | `TransportProtocol` | `UNKNOWN_TRANSPORT_PROTOCOL`, `UDP`, `TCP` |
 | `ProxyProtocol` | `UNKNOWN_PROXY_PROTOCOL`, `SOCKS5_PROXY_PROTOCOL` |
 | `MultiplexingLevel` | `MULTIPLEXING_DEFAULT`, `MULTIPLEXING_OFF`, `MULTIPLEXING_LOW`, `MULTIPLEXING_MIDDLE`, `MULTIPLEXING_HIGH` |
 | `HandshakeMode` | `HANDSHAKE_DEFAULT`, `HANDSHAKE_STANDARD`（1-RTT）, `HANDSHAKE_NO_WAIT`（0-RTT 式 piggyback） |
-| `NonceType` | `NONCE_TYPE_RANDOM`, `NONCE_TYPE_PRINTABLE`, `NONCE_TYPE_PRINTABLE_SUBSET`, `NONCE_TYPE_FIXED` |
-| `LowEntropyMode` | `LOW_ENTROPY_MODE_OFF`, `LOW_ENTROPY_MODE_32`, `LOW_ENTROPY_MODE_40`, `LOW_ENTROPY_MODE_48`, `LOW_ENTROPY_MODE_56` |
-| `LowEntropyMaskRotation` | `LOW_ENTROPY_MASK_NO_ROTATION`, `LOW_ENTROPY_MASK_ROTATE_RIGHT_1..15`, `LOW_ENTROPY_MASK_ROTATE_LEFT_1..15` |
 | `EgressAction` | `PROXY`, `DIRECT`, `REJECT` |
 | `CipherSuite` | 见 §2 映射表（`CIPHER_SUITE_UNSPECIFIED` 非法） |
-
-`LowEntropyMaskRotation` 数值：`NO_ROTATION=0`；`ROTATE_RIGHT_k=k`（1..15）；`ROTATE_LEFT_k = 16·k`（k=1..15，即 16,32,…,240）。V0.2 线格式只用 1 字节 `R ∈ [0,63]`；配置层按 protocol-v0.2.md §7.2 的转换表映射：`NO_ROTATION → 0`，`ROTATE_RIGHT_k → k`，`ROTATE_LEFT_k → 64−k`（左移 k 等价于右移 64−k）。该映射保证所有合法配置值都落入 `[0,63]`。
 
 ---
 
@@ -212,11 +177,10 @@ pub struct ClientProfile {
     pub mtu: Option<i32>,
     pub multiplexing: Option<MultiplexingConfig>,
     pub handshake_mode: Option<HandshakeMode>,
-    pub traffic_pattern: Option<TrafficPattern>,
     pub dialer: Option<ClientDialer>,
     pub cipher_suites: Vec<CipherSuite>,       // JSON: cipherSuites
 }
-// ServerConfig、User、Auth、TrafficPattern、Egress、DNS 等同理。
+// ServerConfig、User、Auth、Egress 等同理。
 // CipherSuite 用自定义 serde：以字符串名反序列化，映射为内部枚举；
 // "CIPHER_SUITE_UNSPECIFIED" 与未知名称在反序列化/校验阶段拒绝。
 ```
@@ -224,7 +188,7 @@ pub struct ClientProfile {
 要求：
 
 - 使用 `#[serde(default)]` 让缺失字段取默认值；用 `rename_all = "camelCase"` 匹配现有字段名（注意 `socks5ListenLAN`、`ipAddress`、`allowPrivateIP` 等大小写需逐字匹配，必要时对个别字段用 `#[serde(rename = "...")]` 精调）。
-- 未知字段：建议 `#[serde(deny_unknown_fields)]` 在严格模式开启；默认宽松忽略，以便旧配置平滑加载。二选一需在实现中统一并文档化。
+- 未知字段：实现统一采用宽松忽略（不使用 `deny_unknown_fields`），以便旧配置平滑加载；已删除的字段（含 `trafficPattern`、`dns`）会被静默丢弃。
 - 枚举反序列化必须接受字符串名；也接受对应数值（兼容 protobuf JSON），但输出统一为字符串名。
 
 ---
@@ -237,15 +201,12 @@ pub struct ClientProfile {
 2. **端口**：`port` / `portRange` 互斥；端口 `1..65535`；`portRange` 形如 `begin-end` 且 `begin ≤ end`。
 3. **`port` 与 `portRange` 不可同时为空**（对需要监听/连接的绑定）。
 4. **`mtu`**：若设置，必须 `1280..1500`。
-5. **`trafficPattern.nonce.maxLen` / `customHexStrings` 各项**：`≤ 12` 字节。
-6. **`trafficPattern.padding.*`**：`0..255`。
-7. **`trafficPattern.tcpFragment.maxSleepMs`**：`≤ 100`。
-8. **`advancedSettings.userHintIsMandatory`**：默认 `true`。
-9. **Egress**：`action=PROXY` 时 `proxyNames` 非空，且每个名字都能解析到某个 `EgressProxy.name`。
-10. **`activeProfile`**：若非空，须匹配某个 `profileName`。
-11. **`hashedPassword`**：若为 hex，长度须为偶数且可解码（建议 32 字节 SHA-256）。
-12. **低熵**：若 `lowEntropy.mode ≠ OFF`，要求运行时启用对应编译特性；否则拒绝或降级为 OFF（策略需统一，建议拒绝并提示特性未启用）。
-13. **DNS hosts**：键为域名、值为可解析 IP 字符串。
+5. **`advancedSettings.userHintIsMandatory`**：默认 `true`。
+6. **Egress**：`action=PROXY` 时 `proxyNames` 非空，且每个名字都能解析到某个 `EgressProxy.name`。
+7. **`activeProfile`**：若非空，须匹配某个 `profileName`。
+8. **`hashedPassword`**：若为 hex，长度须为偶数且可解码（建议 32 字节 SHA-256）。
+
+已删除的 `trafficPattern` 与 `dns` 不再校验；它们作为未知字段被忽略。
 
 ---
 
@@ -300,7 +261,6 @@ shadowlemons://<user>:<password>@<host>/?<query>
 | `multiplexing` | `multiplexing.level` | 枚举名，如 `MULTIPLEXING_HIGH` |
 | `handshake-mode` | `handshakeMode` | 枚举名，如 `HANDSHAKE_NO_WAIT` |
 | `cipher-suites` | `cipherSuites` | 枚举名逗号分隔，如 `CIPHER_SUITE_AES_256_GCM,CIPHER_SUITE_XCHACHA20_POLY1305` |
-| `traffic-pattern` | `trafficPattern` | 可选，protobuf/等价二进制的标准 base64 |
 | `port` | 每个 `portBindings[].portRange` 或 `port` | 可重复，与 `protocol` 一一对应 |
 | `protocol` | 每个 `portBindings[].protocol` | 可重复，如 `TCP`、`UDP` |
 
@@ -334,7 +294,7 @@ JSON 字段名 **全部保留**，无需改名。下表给出完整对照并标�
 | `ClientProfile.mtu` | `mtu` | 不变；语义为 L3 MTU，`1280..1500` |
 | `ClientProfile.multiplexing.level` | `multiplexing.level` | 不变 |
 | `ClientProfile.handshakeMode` | `handshakeMode` | 不变；V0.2 握手固定 1-RTT，但允许应用数据 piggyback |
-| `ClientProfile.trafficPattern` | `trafficPattern` | 不变；低熵编码规则已简化 |
+| `ClientProfile.trafficPattern` | — | **已删除，不再实现**（配置从未接入数据面） |
 | `ClientProfile.dialer` | `dialer` | 不变 |
 | `ClientProfile.cipherSuites` | `cipherSuites` | 字段名不变；枚举名不变；**映射到新的线套件号 0/1/2（见 §2）** |
 | `ServerConfig.listenIPAddress` | `listenIPAddress` | 不变 |
@@ -343,14 +303,15 @@ JSON 字段名 **全部保留**，无需改名。下表给出完整对照并标�
 | `ServerConfig.advancedSettings.userHintIsMandatory` | `advancedSettings.userHintIsMandatory` | 不变，默认 `true`；pepper 字符串改为 V0.2 |
 | `ServerConfig.advancedSettings.allowLocalDestination`（已保留 1） | — | **已删除，不实现** |
 | `ServerConfig.advancedSettings.metricsLoggingInterval`（已保留 2） | — | **已删除，不实现** |
-| `ServerConfig.loggingLevel` / `mtu` / `egress` / `dns` | 同名 | 不变 |
-| `ServerConfig.trafficPattern` | `trafficPattern` | 不变 |
+| `ServerConfig.loggingLevel` / `mtu` / `egress` | 同名 | 不变 |
+| `ServerConfig.dns` | — | **已删除，不再实现**；域名解析使用系统解析器 |
+| `ServerConfig.trafficPattern` | — | **已删除，不再实现**（配置从未接入数据面） |
 | `ServerConfig.cipherSuites` | `cipherSuites` | 字段名不变；枚举名不变；线套件号映射见 §2 |
-| `Egress` / `EgressProxy` / `EgressRule` / `DNS` 全部字段 | 同名 | 不变 |
+| `Egress` / `EgressProxy` / `EgressRule` 全部字段 | 同名 | 不变 |
 | 协议层 `timeSalt` / 时间槽 / 元数据 `timestamp` | **无对应配置字段** | V0.2 从协议层彻底移除；无需时钟同步；配置中从未有过这些字段，故无字段可迁移 |
 | 协议版本 3（隐含） | 版本 4（隐含） | 不在配置中体现；big-bang 不兼容 |
 
-**被删除/不实现的字段汇总**：`rpcPort`、`ClientConfig.advancedSettings`、`httpProxyPort`、`httpProxyListenLAN`、`User.quotas`、`ServerAdvancedSettings.allowLocalDestination`、`ServerAdvancedSettings.metricsLoggingInterval`。其中与「时间」相关的是协议层的 `timeSalt`/`timestamp` 概念（在 V0.1 中也没有对应的配置字段），V0.2 一并从协议中消除。
+**被删除/不实现的字段汇总**：`rpcPort`、`ClientConfig.advancedSettings`、`httpProxyPort`、`httpProxyListenLAN`、`User.quotas`、`ServerAdvancedSettings.allowLocalDestination`、`ServerAdvancedSettings.metricsLoggingInterval`、`ClientProfile.trafficPattern`、`ServerConfig.trafficPattern`、`ServerConfig.dns`。其中与「时间」相关的是协议层的 `timeSalt`/`timestamp` 概念（在 V0.1 中也没有对应的配置字段），V0.2 一并从协议中消除。`trafficPattern` 与 `dns` 被删除是因为它们只被解析、从未进入数据面；保留它们只会误导运维。
 
 ---
 
@@ -359,11 +320,11 @@ JSON 字段名 **全部保留**，无需改名。下表给出完整对照并标�
 | 项 | V0.1（Go） | V0.2（Rust） |
 | :-- | :-- | :-- |
 | 配置序列化 | protobuf（`appctlpb`）+ `common.MarshalJSON` | serde 直接对同样的 JSON 形状序列化 |
-| JSON 字段名 | 见本文各表 | **完全保留**，现有 JSON 可直接加载 |
+| JSON 字段名 | 见本文各表 | 除已删除的 `trafficPattern` / `dns` 外完全保留，现有 JSON 可直接加载 |
 | `CipherSuite` 枚举 | `UNSPECIFIED=0, XCHACHA20=1, AES256=2, AES128=3` | 不变；新增到线套件号 0/1/2 的显式映射函数 |
 | 线套件号 | `cipher.Suite` 0/1/2 | 不变 |
 | 时间相关配置 | 无（时间在协议层由系统时钟推导） | 无；协议层移除时间盐与 timestamp，配置无需变更 |
-| 低熵配置 | `trafficPattern.lowEntropy` 控制编码 | 字段名不变；编码算法简化、feature-gated、默认 OFF |
+| 低熵配置（原 `trafficPattern.lowEntropy`） | `trafficPattern.lowEntropy` 控制编码 | 配置字段已删除；线协议语义不再有配置入口 |
 | 用户提示 pepper | `"ShadowLemon V0.1 user hint pepper"` | `"ShadowLemon V0.2 user hint pepper"`（协议常量，非配置） |
 | `apply/replace/describe` | 合并补丁 / 整体替换 / 查看 | 语义保持一致 |
 | URL scheme | `shadowlemon://`（protobuf+base64）、`shadowlemons://`（手工 query） | 保持一致；未知套件名必须报错 |

@@ -5,13 +5,11 @@
 //! the handful of names whose capitalization differs (for example
 //! `socks5ListenLAN` and `allowPrivateIP`) use an explicit `rename`.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::enums::{
-    CipherSuite, DualStack, EgressAction, HandshakeMode, LoggingLevel, LowEntropyMaskRotation,
-    LowEntropyMode, MultiplexingLevel, NonceType, ProxyProtocol, TransportProtocol,
+    CipherSuite, EgressAction, HandshakeMode, LoggingLevel, MultiplexingLevel, ProxyProtocol,
+    TransportProtocol,
 };
 
 fn default_true() -> bool {
@@ -67,8 +65,6 @@ pub struct ClientProfile {
     pub multiplexing: Option<MultiplexingConfig>,
     /// Handshake mode.
     pub handshake_mode: Option<HandshakeMode>,
-    /// Traffic-shape fine tuning.
-    pub traffic_pattern: Option<TrafficPattern>,
     /// Optional upstream proxy used to reach the ShadowLemon server.
     pub dialer: Option<ClientDialer>,
     /// Ordered cipher-suite preferences (config enum names).
@@ -85,7 +81,6 @@ impl Default for ClientProfile {
             mtu: Some(1400),
             multiplexing: None,
             handshake_mode: None,
-            traffic_pattern: None,
             dialer: None,
             cipher_suites: Vec::new(),
         }
@@ -164,10 +159,6 @@ pub struct ServerConfig {
     pub mtu: Option<i32>,
     /// Egress proxies and rules.
     pub egress: Option<Egress>,
-    /// Domain-name resolution settings.
-    pub dns: Option<DNS>,
-    /// Traffic-shape fine tuning.
-    pub traffic_pattern: Option<TrafficPattern>,
     /// Cipher suites the server accepts, in preference order.
     pub cipher_suites: Vec<CipherSuite>,
 }
@@ -182,8 +173,6 @@ impl Default for ServerConfig {
             logging_level: LoggingLevel::Default,
             mtu: Some(1400),
             egress: None,
-            dns: None,
-            traffic_pattern: None,
             cipher_suites: Vec::new(),
         }
     }
@@ -272,85 +261,6 @@ pub struct EgressRule {
     pub action: EgressAction,
     /// Proxy names referenced when `action` is `PROXY`.
     pub proxy_names: Vec<String>,
-}
-
-/// Domain-name resolution settings.
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
-#[serde(default, rename_all = "camelCase")]
-pub struct DNS {
-    /// IP version preference.
-    pub dual_stack: DualStack,
-    /// Static domain-to-IP mappings, like `/etc/hosts`.
-    ///
-    /// A `BTreeMap` keeps serialization deterministic (required by the binary
-    /// payload used for `shadowlemon://` URLs).
-    pub hosts: BTreeMap<String, String>,
-}
-
-/// Traffic-shape fine tuning, shared by client and server.
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
-#[serde(default, rename_all = "camelCase")]
-pub struct TrafficPattern {
-    /// Seed used to derive implicit traffic patterns.
-    pub seed: Option<i32>,
-    /// Allow implicit patterns to use all available options.
-    pub unlock_all: Option<bool>,
-    /// Extra TCP fragmentation.
-    pub tcp_fragment: Option<TCPFragment>,
-    /// Nonce-prefix manipulation.
-    pub nonce: Option<NoncePattern>,
-    /// Padding behavior.
-    pub padding: Option<PaddingPattern>,
-    /// Feature-gated low-entropy behavior (default OFF).
-    pub low_entropy: Option<LowEntropyPattern>,
-}
-
-/// Extra TCP fragmentation settings.
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
-#[serde(default, rename_all = "camelCase")]
-pub struct TCPFragment {
-    /// Enable additional TCP fragmentation.
-    pub enable: Option<bool>,
-    /// Upper bound (milliseconds) for sleeps between fragments; at most 100.
-    pub max_sleep_ms: Option<i32>,
-}
-
-/// Nonce-prefix manipulation settings.
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
-#[serde(default, rename_all = "camelCase")]
-pub struct NoncePattern {
-    /// Manipulation strategy; JSON field name is `type`.
-    #[serde(rename = "type")]
-    pub nonce_type: NonceType,
-    /// Apply the pattern to every UDP packet, not just the first.
-    #[serde(rename = "applyToAllUDPPacket")]
-    pub apply_to_all_udp_packet: bool,
-    /// Minimum number of prefix bytes to manipulate.
-    pub min_len: Option<i32>,
-    /// Maximum number of prefix bytes to manipulate; at most 12.
-    pub max_len: Option<i32>,
-    /// Hex strings (no `0x`) describing fixed nonce prefixes, at most 12 bytes each.
-    pub custom_hex_strings: Vec<String>,
-}
-
-/// Padding length settings. Zero disables the corresponding padding.
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
-#[serde(default, rename_all = "camelCase")]
-pub struct PaddingPattern {
-    /// Maximum middle padding length, in `0..=255`.
-    pub max_middle_padding_len: Option<i32>,
-    /// Maximum end padding length, in `0..=255`.
-    pub max_end_padding_len: Option<i32>,
-}
-
-/// Feature-gated low-entropy behavior.
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
-#[serde(default, rename_all = "camelCase")]
-pub struct LowEntropyPattern {
-    /// Amount of entropy reduction; `LOW_ENTROPY_MODE_OFF` disables it.
-    pub mode: LowEntropyMode,
-    /// Mask rotation between adjacent 64-bit chunks.
-    pub mask_rotation: LowEntropyMaskRotation,
 }
 
 /// Parse a `"begin-end"` inclusive port range into `(begin, end)`.

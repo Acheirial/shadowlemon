@@ -89,9 +89,6 @@ shadowlemon server replace config <FILE>
     ],
     "loggingLevel": "INFO",
     "mtu": 1400,
-    "dns": {
-        "dualStack": "PREFER_IPv4"
-    },
     "cipherSuites": [
         "CIPHER_SUITE_XCHACHA20_POLY1305",
         "CIPHER_SUITE_AES_256_GCM",
@@ -105,8 +102,7 @@ shadowlemon server replace config <FILE>
 3. 在 `users` -> `name` 属性中填写用户名。
 4. 在 `users` -> `password` 属性中填写该用户的密码。
 5. 【可选】`mtu` 属性是使用 UDP 代理协议时网络路径的 L3 MTU，即能够通过的最大 IP 报文长度，取值范围是 1280 到 1500，默认值是 1400。UDP 的有效载荷预算会在此基础上另外扣除 IP 报文头与 UDP 报文头（IPv6 下最多 48 字节，即 40 字节 IPv6 头加 8 字节 UDP 头）。服务器与客户端必须使用相同的值。
-6. 【可选】建议将 `dns` -> `dualStack` 设置为 `PREFER_IPv4`，尤其是在服务器不支持 IPv6 时。其他选项和静态主机映射请参见 [DNS 策略](#dns-策略)。
-7. 【可选】`cipherSuites` 属性是服务端允许使用的密码套件列表，**列表顺序就是服务端的偏好顺序**。可以使用的值包括 `CIPHER_SUITE_XCHACHA20_POLY1305`，`CIPHER_SUITE_AES_256_GCM` 和 `CIPHER_SUITE_AES_128_GCM`。**未设置或者设置为空列表时，服务端接受全部三种套件**。会话最终使用的套件由客户端与服务端在握手时协商决定，规则和适用场景见[密码套件](#密码套件)：服务端按自己的偏好顺序从交集中挑选，不按客户端首选套件（信封套件）的密钥长度过滤候选。
+6. 【可选】`cipherSuites` 属性是服务端允许使用的密码套件列表，**列表顺序就是服务端的偏好顺序**。可以使用的值包括 `CIPHER_SUITE_XCHACHA20_POLY1305`，`CIPHER_SUITE_AES_256_GCM` 和 `CIPHER_SUITE_AES_128_GCM`。**未设置或者设置为空列表时，服务端接受全部三种套件**。会话最终使用的套件由客户端与服务端在握手时协商决定，规则和适用场景见[密码套件](#密码套件)：服务端按自己的偏好顺序从交集中挑选，不按客户端首选套件（信封套件）的密钥长度过滤候选。
 
 用户与端口设置的取值需通过校验，否则 `shadowlemon server apply config` 会报错：
 
@@ -269,31 +265,9 @@ shadowlemon 客户端 -> 互联网 -> shadowlemon 服务器 -> cloudflare 代理
 
 如果想要关闭出站代理功能，将 `egress` 属性设置为空 `{}` 即可。
 
-### DNS 策略
+### 域名解析
 
-当代理客户端请求域名时，代理服务器会先解析域名，然后再建立连接。可以按如下方式配置 DNS 策略和静态主机映射：
-
-```js
-{
-    "dns": {
-        "dualStack": "PREFER_IPv4",
-        "hosts": {
-            "example.com": "93.184.216.34",
-            "ipv6.example.com": "2606:2800:220:1:248:1893:25c8:1946"
-        }
-    }
-}
-```
-
-`dns` -> `dualStack` 属性支持以下值：
-
-1. `USE_FIRST_IP`：使用 DNS 服务器返回的第一个 IP 地址。这是默认策略。
-2. `PREFER_IPv4`：优先使用 IPv4，然后回退到 IPv6。
-3. `PREFER_IPv6`：优先使用 IPv6，然后回退到 IPv4。
-4. `ONLY_IPv4`：仅使用 IPv4。如果没有可用的 IPv4 地址，则连接失败。
-5. `ONLY_IPv6`：仅使用 IPv6。如果没有可用的 IPv6 地址，则连接失败。
-
-可选的 `dns` -> `hosts` 属性用于定义静态的域名到 IP 地址映射。每个键必须是域名，每个值必须是有效的 IPv4 或 IPv6 地址。域名采用精确匹配且不区分大小写；不支持通配符和 DNS 后缀匹配。域名不能以点号开头或结尾。
+服务端不再提供 `dns` 配置：域名统一使用系统解析器解析，不再支持配置双栈偏好与静态 hosts 映射。
 
 ### 允许用户访问内网
 
