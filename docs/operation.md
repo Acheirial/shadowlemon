@@ -219,7 +219,7 @@ V0.2 推荐用 YAML 格式保存配置，默认文件名为 `client.yaml` / `ser
 | `SHADOWLEMON_CLIENT_CONFIG_YAML_FILE` | 从该路径加载 YAML 格式客户端配置文件（例如 `/etc/shadowlemon/client.yaml`）。 |
 | `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式服务器配置文件（兼容旧部署，不推荐）。 |
 | `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式客户端配置文件（兼容旧部署，不推荐）。 |
-| `SHADOWLEMON_ENVELOPE_SECRET` | 部署秘密：用于加密 UDP 路由信封与派生用户 hint。客户端与服务端必须设置**相同**的值，否则无法通信。未设置时回退到内置默认值（兼容旧部署，但不建议用于对抗指纹）。 |
+| `SHADOWLEMON_ENVELOPE_SECRET` | **必填**。部署秘密：用于加密 UDP 路由信封与派生用户 hint。客户端与服务端必须设置**相同**的高熵值，否则无法通信。进程启动时缺失或为空会直接报错退出；不存在内置默认值，因为公开常量会让观察者从每包 nonce 反推出信封的 kind 与会话 ID。 |
 | `SHADOWLEMON_LOG_NO_TIMESTAMP` | 非空时关闭日志时间戳（配合 journald 等已自带时间戳的日志系统使用）。 |
 
 配置支持 YAML（推荐）与 JSON（兼容但不推荐）两种格式，按内容自动识别；从自定义路径加载时使用上表中的环境变量。通用的 `SHADOWLEMON_{CLIENT,SERVER}_CONFIG_FILE` 也接受两种格式，但会拒绝旧的 protobuf 内容。

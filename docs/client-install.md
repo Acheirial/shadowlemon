@@ -37,8 +37,12 @@ cargo build --release
 字段名与格式见 `rust/docs/config-v0.2.md`。两种格式字段名相同；若同目录已有旧的 `client.json`，会继续使用它并提示迁移。如需从自定义路径加载配置（例如 `/etc/shadowlemon/client.yaml`），使用：
 
 ```sh
-SHADOWLEMON_CLIENT_CONFIG_YAML_FILE=/etc/shadowlemon/client.yaml shadowlemon client run
+SHADOWLEMON_CLIENT_CONFIG_YAML_FILE=/etc/shadowlemon/client.yaml \
+SHADOWLEMON_ENVELOPE_SECRET=<与服务端一致的高熵随机值> \
+shadowlemon client run
 ```
+
+`SHADOWLEMON_ENVELOPE_SECRET` 为必填项，客户端与服务端必须设置相同的值；缺失时进程拒绝启动。使用 systemd 时可参照 `configs/examples/shadowlemon-client.service` 中的 `EnvironmentFile`。
 
 ## 修改客户端的设置
 

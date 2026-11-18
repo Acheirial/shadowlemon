@@ -35,15 +35,17 @@ Rust 已是 ShadowLemon 的唯一实现，Go 实现已随 V0.2 一起移除；V0
 抗指纹加固（见 `protocol-v0.2.md` §10.1）已消除 UDP 固定明文头、顺序会话 ID 与零填充。四个 SubAgent 的专项审计（线格式 / UDP 传输 / 应用层 / 已有调研）先前指出的以下实现层特征，现已修复：
 
 - **握手响应定长（已修）**：`handshake.rs::encode_response` 现在加 `0..=MAX_SUFFIX_PADDING` 随机后缀，响应长度不再恒定；客户端 `decode_segment` 本就按元数据长度读取。
-- **piggyback 长度泄露目标类型（已修）**：`build_request` 在 SOCKS5 请求前加 2 字节长度前缀并把 piggyback 区填满到 `piggyback_capacity()`，`accept` 按前缀剥离，所有 CONNECT/UDP ASSOCIATE 请求密文长度一致。
+- **piggyback 长度泄露目标类型（已修）**：`build_request` 在 SOCKS5 请求前加 2 字节长度前缀，`accept` 按前缀剥离，命令类型不再泄露。piggyback 区长度从 `MAX_SESSION_PAYLOAD - 28 ..= MAX_SESSION_PAYLOAD` 中随机抽取（首包整包约 1305–1345B），与数据帧长度区间重叠，不再有固定的 1024B 载荷指纹。
 - **重传逐字节相同（已修）**：`session.rs` 缓存明文片段，重传用原 seq 配新 nonce 与新随机填充重新加密。
 - **心跳时序（已修）**：心跳间隔改为 2–15 秒均匀分布（原 5±1 秒 + 长尾使 87.5% 落在 4–6 秒）。
-- **UDP `kind` 混淆（已修）**：`wrap_udp`/`unwrap_udp` 改为用部署秘密 `SHADOWLEMON_ENVELOPE_SECRET`（默认回退到旧 pepper）从每包 nonce 派生 5 字节 keystream，对 5 字节路由信封整体加密，会话内前缀不再恒定、kind 不可反推。
+- **UDP `kind` 混淆（已修）**：`wrap_udp`/`unwrap_udp` 用部署秘密 `SHADOWLEMON_ENVELOPE_SECRET` 从每包 nonce 派生 5 字节 keystream，对 5 字节路由信封整体加密，会话内前缀不再恒定、kind 不可反推。该秘密现在**必填**，不再回退到公开 pepper——否则观察者可用公开常量反推出信封内容并跨包关联会话。
 - **用户名 hint 泄漏（已修）**：user hint 改用同一部署秘密，不再是公开常量，观察者无法离线枚举用户名。
 - **目标域名明文 DNS（已修）**：客户端 SOCKS5 入口注入 `PassThroughResolver`，不本地解析域名；域名经隧道在服务端出口解析。UDP ASSOCIATE 的 per-datagram 域名通过 `DatagramSocket::send_to_host` 传递，reply header 映射增加按端口的回退。服务端出口 DNS 仍为明文，建议在服务器上用本地 DoH/DoT stub。
 - **客户端 ticker 2ms 量化（已修）**：改为 `next_timer()` 精确唤醒 + 入站帧 `Notify` 唤醒；ACK 包络 padding 扩到 255 字节。
+- **单向心跳（已修）**：服务端 reply flusher 现在也按 `next_timer()` 精确唤醒调用 `Session::tick`，在空闲时主动发送心跳 ACK；心跳不再只由客户端发出。
+- **大响应定长分片（保持原状，随机化已回退）**：曾尝试把 `fragment_payload` 的片长随机化（宽区间与仅抖动末两片两种方案），但实测都会让 64KB 大响应在 loopback 上卡住 / 返回空响应——用户态 ARQ 没有 pacing，不均匀分片与发送窗口、重组相互干扰。线层每帧已有的 0–32 字节随机前后缀提供了包长抖动，因此分片长度保持定长，正确性优先。
 
-**仍存在的统计型特征**：大响应被拆成约 54 个近 MTU 的定长数据报——曾尝试每数据报随机分片大小，但会导致重组不稳定、大 body 卡住，已回退为定长分片（正确性优先）。包长双峰（~80B 控制 / ~1350B 数据）、cwnd 慢启动爬坡、单向心跳等仍可被协议感知型 DPI 利用；真正的覆盖流量与长度桶不在 V0.2 范围。评估缺口见 §9。
+**仍存在的统计型特征**：包长仍有控制帧（约 77–587B）与数据帧（约 1300–1370B）的双峰；cwnd 慢启动爬坡与 burst 发送仍在；心跳虽已双向且间隔 2–15 秒均匀随机，长期观测仍可统计。真正的覆盖流量与长度桶不在 V0.2 范围。评估缺口见 §9。
 
 ## 9. 抗指纹效果的实测结果与残留未测项
 

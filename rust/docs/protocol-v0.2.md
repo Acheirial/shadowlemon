@@ -18,7 +18,7 @@
 | `WIRE_NONCE_LEN` | `24` | 线路 nonce 恒为 24 字节 |
 | `METADATA_LEN` | `32` | 元数据明文恒为 32 字节 |
 | `TAG_LEN` | `16` | AEAD 认证标签恒为 16 字节 |
-| `MAX_SESSION_PAYLOAD` | `1024` | 会话元数据可携带的最大载荷 |
+| `MAX_SESSION_PAYLOAD` | `1236` | 会话元数据（类型 2–5）可携带的最大载荷；握手请求 piggyback 区从中随机取 `−28..=0` |
 | `MAX_FRAGMENT` | `32768` | TCP 单个应用分片的最大长度 |
 | `MAX_HANDSHAKE_SUITES` | `4` | 握手中套件数量的上限 |
 | `EPH_PUB_LEN` | `32` | X25519 一次性公钥长度 |
@@ -273,11 +273,11 @@ s2cKey    = HKDF-SHA256(ikm=shared, salt=salt, info=info_s2c, L=finalSuite.KeyLe
 | 1 | 1 | `flags / reserved` | V0.2 恒 0 |
 | 2 | 4 | `session ID` | u32be |
 | 6 | 4 | `sequence number` | u32be，会话内每方向递增 |
-| 10 | 2 | `payload length` | u16be，`≤ 1024`；载荷长度（不含 16 字节标签） |
+| 10 | 2 | `payload length` | u16be，`≤ 1236`；载荷长度（不含 16 字节标签） |
 | 12 | 1 | `suffix length` | padding 2 长度 |
 | 13 | 19 | `reserved` | 全 0 |
 
-校验：`protocol type ∈ {2,3,4,5}`；`payload length ≤ 1024`。V0.1 中的 `status code` 字段已删除——握手状态由响应载荷的 `status` 表达，关闭会话无需状态码。
+校验：`protocol type ∈ {2,3,4,5}`；`payload length ≤ 1236`。V0.1 中的 `status code` 字段已删除——握手状态由响应载荷的 `status` 表达，关闭会话无需状态码。
 
 ### 6.2 数据元数据（类型 6/7/8/9）
 
@@ -526,8 +526,8 @@ sig = FNV1a64(m)
 以下措施是 V0.2 实现层为削弱被动流量指纹而采取的约定，不改变线格式字段的长度与语义，但要求两端同时升级：
 
 1. **随机会话 ID**：`session ID` 不再从 1 递增分配，而是随机取非零 `u32`（与当前存活会话查重）。UDP 路由头中不再出现递增的 `00 00 00 01` 序列。
-2. **UDP 路由头混淆**：§9 的 5 字节头保留，但 `kind` 字节改为 `kind XOR mix(session ID)`，其中 `mix` 为 32 位 MurmurHash3 finalizer 取低 8 位。这是对**固定字节 DPI 签名**的混淆，不是加密；协议感知的观察者仍可反推 `kind`。
-3. **始终随机填充**：实现层为每条数据帧、ACK、关闭帧以及握手请求生成随机长度的前缀/后缀填充（各 `0..=32` 字节，随机内容）。长度逐帧重抽，避免固定长度指纹；接收端仍按元数据 `prefixLen` / `suffixLen` 读取。握手响应保持固定长度，因为 TCP 读取端依赖该定长约定。
+2. **UDP 路由头混淆**：§9 的 5 字节头（`kind` + `session ID`）整体与 keystream 逐字节异或：`keystream = SHA256(deploymentSecret || wireNonce[0..4])[0..5]`。salt 取自每包随机 nonce，因此掩码逐包变化，会话内没有恒定的前缀字节。`deploymentSecret` 来自两端必须一致设置的 `SHADOWLEMON_ENVELOPE_SECRET`，**无内置默认值**；若使用公开常量，观察者可从 salt 复算 keystream 并反推 `kind` 与会话 ID。
+3. **始终随机填充与随机首包长度**：实现层为每条数据帧、ACK、关闭帧以及握手请求生成随机长度的前缀/后缀填充（各 `0..=32` 字节，随机内容）。长度逐帧重抽；接收端按元数据 `prefixLen` / `suffixLen` 读取。握手请求的 piggyback 区长度从 `MAX_SESSION_PAYLOAD - 28 ..= MAX_SESSION_PAYLOAD` 中随机抽取，握手响应的 `payload` 后附 `0..=32` 字节随机后缀——两者长度都不再恒定，且首包长度与数据帧区间重叠。
 4. **MTU 预算**：`udp_payload_budget` 在 L3 MTU 中额外扣除 5 字节路由头与最大填充预算，确保 IP 总长不超过配置值。
 5. **配置层清理**：`trafficPattern`（含 nonce / padding / lowEntropy / tcpFragment / seed / unlockAll）与 `dns` 等被解析但从未贯穿到数据面的配置项已从配置 schema 中移除；真实生效的流量相关配置仅为 `mtu`、`multiplexing`、`egress`、`handshakeMode`、`cipherSuites` 与 `userHintIsMandatory`。
 

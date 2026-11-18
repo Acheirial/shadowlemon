@@ -44,8 +44,11 @@ sudo install -m 755 rust/target/release/shadowlemon /usr/local/bin/shadowlemon
 
 ```ini
 Environment=SHADOWLEMON_SERVER_CONFIG_YAML_FILE=/etc/shadowlemon/server.yaml
+EnvironmentFile=/etc/shadowlemon/envelope-secret.env
 ExecStart=/usr/bin/shadowlemon server run
 ```
+
+`/etc/shadowlemon/envelope-secret.env` 必须包含客户端与服务端一致的部署秘密（例如 `SHADOWLEMON_ENVELOPE_SECRET=<高熵随机值>`），文件权限设为 0600。该变量为必填；缺失时进程拒绝启动。
 
 ## 修改代理服务器设置
 
