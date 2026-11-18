@@ -3,8 +3,8 @@ rust/target/
 rust/fuzz/target/
 **/*.rs.bk
 
-# Build outputs
-bin/
+# Build outputs (repository root only; do not ignore rust/test-utils/src/bin/)
+/bin/
 
 # Coverage and logs
 coverage.*
