@@ -558,6 +558,85 @@ mod tests {
         }
     }
 
+    /// A CONNECT response larger than the stream layer's 60 KiB read chunk must
+    /// be delivered in full; the tunnel socket used to drop the tail.
+    #[tokio::test]
+    async fn end_to_end_connect_large_response_is_not_truncated() {
+        const BODY_LEN: usize = 64 * 1024 + 512;
+        let body: Vec<u8> = (0..BODY_LEN).map(|i| (i % 251) as u8).collect();
+
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let payload = body.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = echo.accept().await else {
+                    break;
+                };
+                let payload = payload.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    if stream.read(&mut buf).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&payload).await;
+                });
+            }
+        });
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let suite = Suite::XChaCha20Poly1305;
+        let server_mux = ServerMux::new(
+            mux_config(),
+            "127.0.0.1".parse().unwrap(),
+            vec![PortBindingSpec::new(port, TransportKind::Udp)],
+            Arc::new(RealServerHandshake::new(server_config(suite)).unwrap()),
+        )
+        .unwrap();
+        server_mux.start().await.unwrap();
+        let client_mux = ClientMux::new(
+            mux_config(),
+            vec![Endpoint::new(
+                "127.0.0.1",
+                vec![PortBindingSpec::new(port, TransportKind::Udp)],
+            )],
+            Box::new(RealClientHandshake::new(client_config(suite)).unwrap()),
+        )
+        .unwrap();
+        let socks = SocksServer::new(SocksConfig::new(Arc::new(client_mux)));
+        let (mut local, remote) = tokio::io::duplex(16 * 1024);
+        let serve = tokio::spawn(async move { socks.serve(remote).await });
+
+        local.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0u8; 2];
+        local.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+        local
+            .write_all(&encode_request(
+                CMD_CONNECT,
+                &Address::Ip(echo_addr.ip()),
+                echo_addr.port(),
+            ))
+            .await
+            .unwrap();
+        let reply = read_reply(&mut local).await.unwrap();
+        assert_eq!(reply[1], 0);
+        local.write_all(b"go").await.unwrap();
+        local.flush().await.unwrap();
+
+        let mut received = vec![0u8; BODY_LEN];
+        tokio::time::timeout(Duration::from_secs(20), local.read_exact(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, body);
+        drop(local);
+        let _ = tokio::time::timeout(Duration::from_secs(2), serve).await;
+        server_mux.stop().await;
+    }
+
     #[tokio::test]
     async fn end_to_end_udp_round_trips_for_every_suite() {
         for suite in Suite::all_suites() {

@@ -399,6 +399,13 @@ impl mux::ClientHandshake for RealClientHandshake {
                 Arc::clone(&handle.shutdown),
             );
             let key_state = Arc::new(KeyUpgradeState::new());
+            spawn_client_ticker(
+                Arc::clone(&session),
+                Arc::clone(&socket),
+                server,
+                session_id,
+                Arc::clone(&handle.shutdown),
+            );
             spawn_stream_key_upgrade(
                 handshake,
                 response_rx,
@@ -518,6 +525,13 @@ impl mux::ClientHandshake for RealClientHandshake {
                 server,
                 shutdown: Arc::new(Notify::new()),
             });
+            spawn_client_ticker(
+                Arc::clone(&session),
+                Arc::clone(&socket),
+                server,
+                session_id,
+                Arc::clone(&handle.shutdown),
+            );
             self.udp_sessions.insert(session_id, handle);
             debug!(session_id, suite = %established.suite, "UDP session established to PacketUnderlay{{");
             let tunnel: Box<dyn DatagramSocket> = Box::new(TunnelDatagramSocket {
@@ -668,6 +682,7 @@ impl mux::ServerHandshake for RealServerHandshake {
         &'a self,
         datagram: Vec<u8>,
         source: SocketAddr,
+        reply_socket: Arc<UdpSocket>,
     ) -> BoxFuture<'a, io::Result<Vec<Vec<u8>>>> {
         Box::pin(async move {
             let Some((kind, session_id, frame)) = unwrap_udp(&datagram) else {
@@ -764,6 +779,10 @@ impl mux::ServerHandshake for RealServerHandshake {
                                 .map_err(io_err)?
                                 .payload_capacity(MAX_PREFIX_PADDING, MAX_SUFFIX_PADDING)
                                 .saturating_sub(APP_FRAGMENT_HEADER_LEN),
+                                ReplyContext {
+                                    client: source,
+                                    socket: Arc::clone(&reply_socket),
+                                },
                             ));
                             self.udp_sessions
                                 .insert((source, session_id), Arc::clone(&state));
@@ -774,6 +793,10 @@ impl mux::ServerHandshake for RealServerHandshake {
                                 let mut guard = state.session.lock().await;
                                 guard.upgrade_keys(c2s, s2c);
                             }
+                            // Start the background reply flusher so large
+                            // responses flow without waiting for more client
+                            // datagrams.
+                            state.spawn_reply_flusher();
                             debug!(session_id, %source, suite = %suite, "server UDP session established");
                             Ok(vec![wrap_udp(
                                 UDP_KIND_HANDSHAKE_RESPONSE,
@@ -797,6 +820,9 @@ impl mux::ServerHandshake for RealServerHandshake {
                         }
                         chunks
                     };
+                    // Processing the inbound frame may have advanced the send
+                    // window via ACKs; wake the flusher to emit more reply data.
+                    state.flusher_wake.notify_one();
                     for chunk in plaintext_chunks {
                         let Some((id, number, count, piece)) = split_app_fragment(&chunk) else {
                             return Err(invalid_data("malformed application fragment"));
@@ -809,12 +835,9 @@ impl mux::ServerHandshake for RealServerHandshake {
                         let target = SocketAddr::new(ip, parsed.port);
                         state.send_payload(target, &parsed.payload).await?;
                     }
-                    // Drain anything the relay already produced, waiting briefly
-                    // for a fast reply so the mux can answer this datagram.
-                    let wait = self.config.udp_reply_wait;
-                    state
-                        .collect_replies(session_id, wait, time::Instant::now() + wait)
-                        .await;
+                    // Reply payloads are encoded and sent by the background
+                    // reply flusher; only the ACKs generated while processing
+                    // this datagram are returned to the mux here.
                     Ok(state.drain_frames().await)
                 }
                 _ => Err(invalid_data("unexpected UDP routing envelope kind")),
@@ -951,6 +974,43 @@ fn spawn_udp_reader(
                 }
                 UDP_KIND_SESSION_REPLY => inbound.push(frame.to_vec()).await,
                 _ => {}
+            }
+        }
+    });
+}
+
+/// Periodically drive a client session's timers so delayed ACKs and
+/// retransmissions are emitted. Frames are sent directly on the client's UDP
+/// socket. The loop exits when the session closes or the socket is gone.
+fn spawn_client_ticker(
+    session: Arc<Mutex<Session>>,
+    socket: Arc<UdpSocket>,
+    server: SocketAddr,
+    session_id: u32,
+    shutdown: Arc<Notify>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(2));
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => break,
+                _ = ticker.tick() => {
+                    let frames = {
+                        let mut guard = session.lock().await;
+                        if guard.is_closed() {
+                            break;
+                        }
+                        let _ = guard.tick(Instant::now());
+                        drain_output(&mut guard)
+                    };
+                    for frame in frames {
+                        let wire = wrap_udp(UDP_KIND_SESSION_DATA, session_id, &frame);
+                        if let Err(err) = socket.send_to(&wire, server).await {
+                            debug!(%err, "client ticker send failed");
+                            break;
+                        }
+                    }
+                }
             }
         }
     });
@@ -1190,9 +1250,21 @@ impl DatagramSocket for TunnelDatagramSocket {
         Box::pin(async move {
             let _guard = self.recv_lock.lock().await;
             loop {
-                if let Some((payload, source)) = self.pending.lock().await.pop_front() {
+                let pending_item = {
+                    let mut pending = self.pending.lock().await;
+                    pending.pop_front()
+                };
+                if let Some((payload, source)) = pending_item {
                     let len = buf.len().min(payload.len());
                     buf[..len].copy_from_slice(&payload[..len]);
+                    // A reassembled datagram may be larger than the caller's
+                    // buffer. Keep the remainder queued instead of dropping it.
+                    if len < payload.len() {
+                        self.pending
+                            .lock()
+                            .await
+                            .push_front((payload[len..].to_vec(), source));
+                    }
                     return Ok((len, source));
                 }
                 let chunks = if let Some(inbound) = &self.inbound {
@@ -1254,9 +1326,18 @@ impl DatagramSocket for TunnelDatagramSocket {
     }
 }
 
+/// Direct reply path to a UDP client, shared from the listener socket.
+struct ReplyContext {
+    client: SocketAddr,
+    socket: Arc<UdpSocket>,
+}
+
 /// Server-side state of one UDP session.
 struct ServerUdpSession {
     session: Arc<Mutex<Session>>,
+    session_id: u32,
+    client: SocketAddr,
+    reply_socket: Arc<UdpSocket>,
     target: Mutex<Option<(SocketAddr, Option<String>)>>,
     outbound: Mutex<Option<Arc<UdpSocket>>>,
     /// CONNECT-over-UDP egress: the write half of the dialed TCP stream.
@@ -1265,6 +1346,8 @@ struct ServerUdpSession {
     replies: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
     reply_tx: mpsc::UnboundedSender<Vec<u8>>,
     pending_frames: Mutex<VecDeque<Vec<u8>>>,
+    /// Woken when an inbound frame (ACK) may unblock more reply frames.
+    flusher_wake: Notify,
     created: Instant,
     max_fragment: usize,
 }
@@ -1277,7 +1360,10 @@ impl ServerUdpSession {
         target: Option<(SocketAddr, Option<String>)>,
         tcp: Option<(TcpWriteHalf, TcpReadHalf, SocketAddr)>,
         max_fragment: usize,
+        reply: ReplyContext,
     ) -> Self {
+        let client = reply.client;
+        let reply_socket = reply.socket;
         let (reply_tx, replies) = mpsc::unbounded_channel();
         let tcp_outbound = tcp.map(|(write_half, read_half, source)| {
             spawn_tcp_reply_reader(read_half, source, reply_tx.clone());
@@ -1294,6 +1380,9 @@ impl ServerUdpSession {
                 ))
                 .expect("valid UDP session configuration"),
             )),
+            session_id,
+            client,
+            reply_socket,
             target: Mutex::new(target),
             outbound: Mutex::new(None),
             tcp_outbound: Mutex::new(tcp_outbound),
@@ -1301,6 +1390,7 @@ impl ServerUdpSession {
             replies: Mutex::new(replies),
             reply_tx,
             pending_frames: Mutex::new(VecDeque::new()),
+            flusher_wake: Notify::new(),
             created: Instant::now(),
             max_fragment,
         }
@@ -1324,6 +1414,70 @@ impl ServerUdpSession {
 
     async fn drain_frames(&self) -> Vec<Vec<u8>> {
         self.pending_frames.lock().await.drain(..).collect()
+    }
+
+    /// Encode one plaintext reply into the session's send queue and flush every
+    /// frame the session is currently willing to emit straight to the client.
+    async fn flush_reply(&self, datagram: &[u8]) {
+        let id = {
+            let mut counter = 0u32;
+            for byte in datagram {
+                counter = counter.wrapping_mul(31).wrapping_add(u32::from(*byte));
+            }
+            counter
+        };
+        let fragments = match fragment_payload(datagram, self.max_fragment, id) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let mut session = self.session.lock().await;
+        for fragment in fragments {
+            let _ = session.send(&fragment).await;
+        }
+        let _ = session.tick(Instant::now());
+        for frame in drain_output(&mut session) {
+            let wire = wrap_udp(UDP_KIND_SESSION_REPLY, self.session_id, &frame);
+            if let Err(err) = self.reply_socket.send_to(&wire, self.client).await {
+                debug!(%err, "background UDP reply send failed");
+            }
+        }
+    }
+
+    /// Flush any frames the session can emit now (e.g. after an ACK advanced
+    /// the send window), without new plaintext input.
+    async fn flush_pending_output(&self) {
+        let mut session = self.session.lock().await;
+        let _ = session.tick(Instant::now());
+        for frame in drain_output(&mut session) {
+            let wire = wrap_udp(UDP_KIND_SESSION_REPLY, self.session_id, &frame);
+            if let Err(err) = self.reply_socket.send_to(&wire, self.client).await {
+                debug!(%err, "background UDP reply send failed");
+            }
+        }
+    }
+
+    /// Start a background task that turns queued plaintext replies into
+    /// encrypted frames and sends them straight to the client on the shared
+    /// listener socket. It also flushes on each inbound ACK so large responses
+    /// keep flowing as the client's receive window advances.
+    fn spawn_reply_flusher(self: &Arc<Self>) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    datagram = async {
+                        let mut replies = state.replies.lock().await;
+                        replies.recv().await
+                    } => {
+                        let Some(datagram) = datagram else { break };
+                        state.flush_reply(&datagram).await;
+                    }
+                    _ = state.flusher_wake.notified() => {
+                        state.flush_pending_output().await;
+                    }
+                }
+            }
+        });
     }
 
     async fn send_payload(&self, target: SocketAddr, payload: &[u8]) -> io::Result<()> {
@@ -1356,51 +1510,6 @@ impl ServerUdpSession {
             ));
         }
         Ok(())
-    }
-
-    async fn collect_replies(&self, session_id: u32, wait: Duration, deadline: time::Instant) {
-        loop {
-            let received = {
-                let mut replies = self.replies.lock().await;
-                if let Ok(datagram) = replies.try_recv() {
-                    Some(datagram)
-                } else if time::Instant::now() < deadline {
-                    match time::timeout(wait, replies.recv()).await {
-                        Ok(Some(datagram)) => Some(datagram),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            };
-            let Some(datagram) = received else { break };
-            let id = {
-                let mut counter = 0u32;
-                // Derive a stable-enough message id from the reply content: a
-                // short rolling hash keeps the assembler key independent of
-                // the request side's message ids.
-                for byte in &datagram {
-                    counter = counter.wrapping_mul(31).wrapping_add(u32::from(*byte));
-                }
-                counter
-            };
-            let fragments = match fragment_payload(&datagram, self.max_fragment, id) {
-                Ok(fragments) => fragments,
-                Err(_) => break,
-            };
-            let mut session = self.session.lock().await;
-            for fragment in fragments {
-                let _ = session.send(&fragment).await;
-            }
-            let _ = session.tick(Instant::now());
-            for frame in drain_output(&mut session) {
-                self.push_frame(wrap_udp(UDP_KIND_SESSION_REPLY, session_id, &frame))
-                    .await;
-            }
-            if self.pending_frames.lock().await.len() >= 8 {
-                break;
-            }
-        }
     }
 }
 

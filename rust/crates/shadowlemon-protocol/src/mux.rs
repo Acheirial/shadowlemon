@@ -359,10 +359,16 @@ pub trait ClientHandshake: Send + Sync + std::fmt::Debug {
 /// order, within the same inbound-datagram turn; an empty vector sends nothing.
 pub trait ServerHandshake: Send + Sync + std::fmt::Debug {
     /// Process one UDP datagram, returning zero or more reply payloads.
+    ///
+    /// `reply_socket` is a shared handle to the bound listener socket. An
+    /// implementation may use it to proactively push additional reply frames to
+    /// `source` (e.g. large CONNECT responses) without waiting for another
+    /// inbound datagram.
     fn accept_udp<'a>(
         &'a self,
         datagram: Vec<u8>,
         source: SocketAddr,
+        reply_socket: Arc<tokio::net::UdpSocket>,
     ) -> BoxFuture<'a, io::Result<Vec<Vec<u8>>>>;
 }
 
@@ -422,6 +428,7 @@ impl ServerHandshake for NoopServerHandshake {
         &'a self,
         _datagram: Vec<u8>,
         _source: SocketAddr,
+        _reply_socket: Arc<tokio::net::UdpSocket>,
     ) -> BoxFuture<'a, io::Result<Vec<Vec<u8>>>> {
         Box::pin(async { Ok(vec![]) })
     }
@@ -1028,7 +1035,12 @@ async fn udp_listener_task(inner: Arc<ServerMuxInner>, port: u16) {
                 };
                 let handshake = Arc::clone(&inner.handshake);
                 let timeout = inner.config.handshake_timeout;
-                let response = time::timeout(timeout, handshake.accept_udp(datagram, source)).await;
+                let reply_socket = underlay.socket_handle();
+                let response = time::timeout(
+                    timeout,
+                    handshake.accept_udp(datagram, source, reply_socket),
+                )
+                .await;
                 inner.underlays.remove(&id);
                 match response {
                     Ok(Ok(replies)) => {

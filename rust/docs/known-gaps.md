@@ -4,9 +4,9 @@ Rust 已是 ShadowLemon 的唯一实现，Go 实现已随 V0.2 一起移除；V0
 
 外部传输现为 UDP-only：TCP 端口绑定在配置校验阶段即被拒绝，SOCKS5 CONNECT（TCP 目标）通过 UDP 隧道的可靠层承载；握手为 0-RTT（early key + piggyback，数据面 I/O gated 到前向安全 key swap 完成，early data 无前向安全）。
 
-## 1. UDP 全双工回复通道
+## 1. UDP 全双工回复通道（已实现）
 
-`ServerHandshake::accept_udp` 现在返回 `Vec<Vec<u8>>`，mux 会把同一轮里排队的所有回复帧都发给客户端（此前只回一帧）。但仍受"入站驱动"限制：服务端只有在收到客户端数据报时才会取回复并发送。SOCKS5 CONNECT 的 TCP 目标若返回大响应（例如 64KB HTTP body，需约 50 个加密回复帧），而客户端在等响应期间不再发数据报，收集窗口（100ms）内只能取到部分帧，其余帧滞留到下一个入站数据报才发出——这会让大响应卡住。单元测试用的小 echo 正常；带大 body 的集成 helper（`httpserver`）会触发该问题。真正的全双工需要服务端持有监听 socket 与客户端地址，用后台任务直接把排队帧发回客户端（绕过"每入站一轮"的模型），这要改动 mux/handshake 边界。
+大响应卡住问题已修复。`ServerHandshake::accept_udp` 接收 mux 监听 socket 的共享句柄（`Arc<UdpSocket>`）并返回 `Vec<Vec<u8>>`；服务端会话持有客户端地址与该句柄，用后台 reply flusher 直接把排队回复帧发回客户端，绕过"每入站一轮"的模型。flusher 在入站 ACK 推进发送窗口后被唤醒，继续冲刷剩余帧。客户端会话有周期性 ticker 驱动延迟 ACK 与重传（此前客户端从不 `tick()`，导致服务端窗口不前进）。CONNECT 大响应（64KB body、约 50 个加密帧）端到端已验证：SHA-1 校验与完整 body 均通过，`end_to_end_connect_large_response_is_not_truncated` 覆盖该回归。残余风险：`client` 与 `server` 的 ticker 使用固定 2ms 间隔而非 `next_timer()` 精确唤醒，高吞吐下可能增加少量空转与 ACK 延迟。
 
 ## 2. Android socket protect 尚未介入建连
 

@@ -10,7 +10,7 @@
 //! The listener rebuild delay follows `reference-go-v3.md` §3.4: 1, 2, 4, 8,
 //! 16, 30 seconds with `[delay/2, delay]` jitter.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
 use shadowlemon_crypto::aead::AeadKey;
@@ -108,7 +108,7 @@ pub fn rebuild_backoff_random(attempt: u32) -> Duration {
 /// A UDP underlay bound to a local address.
 #[derive(Debug)]
 pub struct PacketUnderlay {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     cipher: WireCipher,
     budget: MtuBudget,
     config: PacketConfig,
@@ -133,7 +133,7 @@ impl PacketUnderlay {
         let socket = bind_socket(addr)?;
         let bind_addr = socket.local_addr()?;
         Ok(Self {
-            socket,
+            socket: Arc::new(socket),
             cipher: WireCipher::new(key),
             budget,
             config,
@@ -158,6 +158,14 @@ impl PacketUnderlay {
         Ok(self.socket.local_addr()?)
     }
 
+    /// Shared handle to the listening socket, used by server-side sessions to
+    /// send queued reply frames directly without waiting for a new inbound
+    /// datagram on the listener loop.
+    #[must_use]
+    pub fn socket_handle(&self) -> Arc<UdpSocket> {
+        Arc::clone(&self.socket)
+    }
+
     /// Destination used by [`Underlay::send_segment`].
     #[must_use]
     pub const fn peer(&self) -> Option<SocketAddr> {
@@ -180,7 +188,7 @@ impl PacketUnderlay {
     /// Callers should sleep for [`rebuild_backoff`] before retrying.
     pub async fn rebind(&mut self) -> UnderlayResult<()> {
         self.closed = false;
-        self.socket = bind_socket(self.bind_addr)?;
+        self.socket = Arc::new(bind_socket(self.bind_addr)?);
         self.bind_addr = self.socket.local_addr()?;
         Ok(())
     }
