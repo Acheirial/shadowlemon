@@ -1,16 +1,12 @@
 # V0.2 Rust 实现：已知缺口与后续工作
 
-Rust 已是 ShadowLemon 的唯一实现，Go 实现已随 V0.2 一起移除；V0.2 没有向后兼容性基线，也不存在与旧实现互通的路径。本文记录当前实现中仍未闭环的跨模块问题。实现已具备完整的 V0.2 线协议（线版本 4）、CLI 与端到端加密数据面（UDP-only 外部传输上的 SOCKS5 CONNECT / UDP associate × 三种套件均有测试），以下问题不影响主路径，但应在后续版本中处理。
+Rust 已是 ShadowLemon 的唯一实现，Go 实现已随 V0.2 一起移除；V0.2 没有向后兼容性基线，也不存在与旧实现互通的路径。项目仅支持 Linux。本文记录当前实现中仍未闭环的跨模块问题。实现已具备完整的 V0.2 线协议（线版本 4）、CLI 与端到端加密数据面（UDP-only 外部传输上的 SOCKS5 CONNECT / UDP associate × 三种套件均有测试），以下问题不影响主路径，但应在后续版本中处理。
 
 外部传输现为 UDP-only：TCP 端口绑定在配置校验阶段即被拒绝，SOCKS5 CONNECT（TCP 目标）通过 UDP 隧道的可靠层承载；握手为 0-RTT（early key + piggyback，数据面 I/O gated 到前向安全 key swap 完成，early data 无前向安全）。
 
 ## 1. UDP 全双工回复通道（已实现）
 
 大响应卡住问题已修复。`ServerHandshake::accept_udp` 接收 mux 监听 socket 的共享句柄（`Arc<UdpSocket>`）并返回 `Vec<Vec<u8>>`；服务端会话持有客户端地址与该句柄，用后台 reply flusher 直接把排队回复帧发回客户端，绕过"每入站一轮"的模型。flusher 在入站 ACK 推进发送窗口后被唤醒，继续冲刷剩余帧。客户端会话有周期性 ticker 驱动延迟 ACK 与重传（此前客户端从不 `tick()`，导致服务端窗口不前进）。CONNECT 大响应（64KB body、约 50 个加密帧）端到端已验证：SHA-1 校验与完整 body 均通过，`end_to_end_connect_large_response_is_not_truncated` 覆盖该回归。客户端 ticker 后续已改为 `next_timer()` 精确唤醒 + 入站帧唤醒（见 §8），消除了该残余风险。
-
-## 2. Android socket protect 尚未介入建连
-
-`shadowlemon_app::platform` 已实现 `SocketProtector` trait、UDS `SCM_RIGHTS` 传输与 1 字节确认握手，但外部传输改为 UDP-only 后，驱动直接在拨号路径创建 UDP 套接字发送数据报，没有暴露 protector 钩子。Android VPN 模式下必须在发送前 protect fd，否则流量会成环。需要在 mux/驱动的 UDP 拨号路径中注入 `Arc<dyn SocketProtector>`，并封装成单一 `protect_and_bind()` 入口（不再有 TCP `connect()` 路径）。
 
 ## 3. DNS 配置已移除；流量特征配置已删除
 
@@ -30,9 +26,9 @@ Rust 已是 ShadowLemon 的唯一实现，Go 实现已随 V0.2 一起移除；V0
 
 凭据存储层保存的 32 字节 credential 已经是 `SHA256(password ‖ 0x00 ‖ username)`，而 `crypto::derive_static_key` 内部又做一次 `hash_password`，因此实际 PBKDF2 输入比规格公式多一次 SHA-256。两端完全一致，且 V0.2 没有兼容性基线，故不影响正确性。若要严格对齐公式，需同时修改 `crypto::kdf`、`serveruser::User` 与 `handshake::ClientHandshake::with_password` 三处。
 
-## 7. 尚未验证的平台目标
+## 7. 尚未验证的 Linux 目标
 
-本地仅完成 x86_64-unknown-linux-gnu 的编译与测试；其余目标（musl、Windows、macOS、Android、MIPS）只通过 CI 配置与文档描述，未在实际设备上运行。由于 Go 实现已移除，不能再依赖原 Go 版本的交叉编译结果作为这些平台的验证依据，所有目标都必须用 Rust 工具链重新验证。MIPS 目标尤其需要真机验证：它是 Rust Tier 3，需要 nightly `-Z build-std` 与匹配 OpenWrt SDK 的工具链。详见 `platform-notes.md`。
+本地仅完成 x86_64-unknown-linux-gnu 的编译与测试；CI 还检查 aarch64-unknown-linux-musl 与 x86_64-unknown-linux-musl 静态构建，但未在实际设备上运行。这些目标都必须用 Rust 工具链重新验证。非 Linux 平台不在支持范围内。
 
 ## 8. 残余流量指纹
 

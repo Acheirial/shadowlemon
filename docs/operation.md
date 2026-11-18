@@ -64,11 +64,7 @@ sudo journalctl -u shadowlemon-server -xe --no-pager -n 200
 
 ### 客户端 (shadowlemon client)
 
-| 操作系统 | 日志目录 | 示例 |
-|----------|----------|------|
-| Linux | `$HOME/.cache/shadowlemon/` 或 `$XDG_CACHE_HOME/shadowlemon/` | `/home/enfein/.cache/shadowlemon/` |
-| macOS | `$HOME/Library/Caches/shadowlemon/` | `/Users/enfein/Library/Caches/shadowlemon/` |
-| Windows | `%USERPROFILE%\AppData\Local\shadowlemon\` | `C:\Users\enfein\AppData\Local\shadowlemon\` |
+客户端日志目录在 Linux 上为 `$HOME/.cache/shadowlemon/` 或 `$XDG_CACHE_HOME/shadowlemon/`，例如 `/home/enfein/.cache/shadowlemon/`。
 
 日志文件命名格式：`yyyyMMdd_HHmm_PID.log`。每次重启 shadowlemon 客户端会生成新文件。日志数量过多时，旧文件会被自动清理。
 
@@ -188,7 +184,7 @@ shadowlemon client apply config <client_config.yaml>
 
 | 可能原因 | 如何检查 | 解决方法 |
 |----------|----------|----------|
-| 端口已被占用 | `lsof -i :1080`（macOS/Linux）或 `netstat -ano \| findstr 1080`（Windows） | 更换 `socks5Port` 为未占用的端口。 |
+| 端口已被占用 | `ss -ltnp \| grep 1080` 或 `lsof -i :1080` | 更换 `socks5Port` 为未占用的端口。 |
 | 配置文件 JSON 语法错误 | `shadowlemon client apply config` 打印错误 | 修正 JSON 语法后重新应用。 |
 | 权限不足（Linux） | 客户端二进制文件无执行权限 | `chmod +x shadowlemon` 或通过软件包安装。 |
 | 日志目录不可写 | 启动日志提示无法创建日志文件 | 检查上表中的日志目录权限。 |
@@ -209,13 +205,9 @@ V0.2 推荐用 YAML 格式保存配置，默认文件名为 `client.yaml` / `ser
 
 ### 客户端
 
-| 操作系统 | 配置路径 | 示例 |
-|----------|----------|------|
-| Linux | `$XDG_CONFIG_HOME/shadowlemon/client.yaml` 或 `~/.config/shadowlemon/client.yaml` | `/home/enfein/.config/shadowlemon/client.yaml` |
-| macOS | `$HOME/Library/Application Support/shadowlemon/client.yaml` | `/Users/enfein/Library/Application Support/shadowlemon/client.yaml` |
-| Windows | `%AppData%\shadowlemon\client.yaml` | `C:\Users\enfein\AppData\Roaming\shadowlemon\client.yaml` |
+客户端配置为 `$XDG_CONFIG_HOME/shadowlemon/client.yaml`，未设置 `XDG_CONFIG_HOME` 时为 `~/.config/shadowlemon/client.yaml`，例如 `/home/enfein/.config/shadowlemon/client.yaml`。
 
-`apply config`、`replace config`、`describe config`、`import config` 等命令读写的都是上表中的文件（或被环境变量覆盖后的路径）。OpenWrt 上通常把配置放在 `/etc/shadowlemon_client_config.yaml` 并通过 `SHADOWLEMON_CLIENT_CONFIG_YAML_FILE` 指定。
+`apply config`、`replace config`、`describe config`、`import config` 等命令读写的都是上述文件（或被环境变量覆盖后的路径）。也可以把配置放在 `/etc/shadowlemon/client.yaml` 并通过 `SHADOWLEMON_CLIENT_CONFIG_YAML_FILE` 指定。
 
 ---
 
@@ -224,11 +216,10 @@ V0.2 推荐用 YAML 格式保存配置，默认文件名为 `client.yaml` / `ser
 | 变量 | 用途 |
 |------|------|
 | `SHADOWLEMON_SERVER_CONFIG_YAML_FILE` | 从该路径加载 YAML 格式服务器配置文件。V0.2 的默认路径为 `~/.config/shadowlemon/server.yaml`（见上文）。 |
-| `SHADOWLEMON_CLIENT_CONFIG_YAML_FILE` | 从该路径加载 YAML 格式客户端配置文件。OpenWrt 上通常用它指向 `/etc/shadowlemon_client_config.yaml`。 |
+| `SHADOWLEMON_CLIENT_CONFIG_YAML_FILE` | 从该路径加载 YAML 格式客户端配置文件（例如 `/etc/shadowlemon/client.yaml`）。 |
 | `SHADOWLEMON_SERVER_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式服务器配置文件（兼容旧部署，不推荐）。 |
 | `SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` | 从该路径加载 JSON 格式客户端配置文件（兼容旧部署，不推荐）。 |
 | `SHADOWLEMON_ENVELOPE_SECRET` | 部署秘密：用于加密 UDP 路由信封与派生用户 hint。客户端与服务端必须设置**相同**的值，否则无法通信。未设置时回退到内置默认值（兼容旧部署，但不建议用于对抗指纹）。 |
-| `SHADOWLEMON_PROTECT_PATH` | Android 平台上与 `VpnService.protect()` 通信的 Unix domain socket 路径（仅 `android` feature 下使用）。 |
 | `SHADOWLEMON_LOG_NO_TIMESTAMP` | 非空时关闭日志时间戳（配合 journald 等已自带时间戳的日志系统使用）。 |
 
 配置支持 YAML（推荐）与 JSON（兼容但不推荐）两种格式，按内容自动识别；从自定义路径加载时使用上表中的环境变量。通用的 `SHADOWLEMON_{CLIENT,SERVER}_CONFIG_FILE` 也接受两种格式，但会拒绝旧的 protobuf 内容。

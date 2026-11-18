@@ -34,7 +34,7 @@ cargo build --release --target x86_64-unknown-linux-gnu
 # 产物：rust/target/x86_64-unknown-linux-gnu/release/shadowlemon
 ```
 
-体积敏感的目标（OpenWrt / musl）使用 `embedded` profile 与 feature，见 [`docs/compile.md`](../../../docs/compile.md)。
+体积敏感的 Linux 构建使用 `embedded` profile 与 feature，见 [`docs/compile.md`](../../../docs/compile.md)。
 
 ## 2. 本地运行场景
 

@@ -250,7 +250,7 @@ CLI 行为与 Go 版本一致（对应 `pkg/cli/client.go`、`pkg/cli/server.go`
 
 - 三种操作都先反序列化为相同 schema，再执行校验；`replace` 必须整体校验通过后才写入，`apply` 合并后也必须整体校验通过。补丁格式按内容自动识别，落盘格式由目标文件扩展名决定（`.json` 保持 JSON，其余写 YAML）。
 - 落盘采用「写临时文件 + 原子重命名」，避免部分写入损坏配置。
-- 默认文件路径：Linux 通常 `~/.config/shadowlemon/client.yaml`（服务端 `server.yaml`），macOS `~/Library/Application Support/shadowlemon`，Windows `%AppData%\shadowlemon`。若同目录下已存在旧的 `client.json` / `server.json`，则继续使用它（并提示迁移到 YAML）。
+- 默认文件路径：Linux 通常 `~/.config/shadowlemon/client.yaml`（服务端 `server.yaml`，尊重 `XDG_CONFIG_HOME`）。若同目录下已存在旧的 `client.json` / `server.json`，则继续使用它（并提示迁移到 YAML）。
 - 环境变量：`SHADOWLEMON_{CLIENT,SERVER}_CONFIG_YAML_FILE` 指定 YAML 文件；`..._CONFIG_JSON_FILE` 指定 JSON 文件；通用的 `..._CONFIG_FILE` 接受两种格式，但拒绝旧 protobuf 内容。
 
 ---

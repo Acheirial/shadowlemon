@@ -67,7 +67,7 @@ shadowlemon client start
 - 安装、配置、流量模式、运营维护与编译说明： [`docs/`](./docs/)
 - 流量指纹实测与 GFW 过墙能力评估： [`docs/traffic-analysis.md`](./docs/traffic-analysis.md)、[`docs/gfw-assessment.md`](./docs/gfw-assessment.md)
 - V0.2 协议（实现级规范）： [`rust/docs/protocol-v0.2.md`](./rust/docs/protocol-v0.2.md)
-- 平台适配与交叉编译说明： [`rust/docs/`](./rust/docs/)
+- Linux 编译与多架构构建说明： [`docs/compile.md`](./docs/compile.md)
 - 配置字段说明： [`rust/docs/config-v0.2.md`](./rust/docs/config-v0.2.md)
 
 ## 许可证

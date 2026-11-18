@@ -6,7 +6,7 @@
 
 ## 下载 shadowlemon 客户端
 
-shadowlemon 客户端软件支持 Windows，Mac OS 和 Linux 系统。你可以从源码编译，也可以直接使用已经编译好的 `shadowlemon` 可执行文件。
+shadowlemon 客户端软件仅支持 Linux 系统。你可以从源码编译，也可以直接使用已经编译好的 `shadowlemon` 可执行文件。
 
 ### 从源码编译
 
@@ -34,10 +34,10 @@ cargo build --release
 | 默认客户端配置 | `$XDG_CONFIG_HOME/shadowlemon/client.yaml`，未设置 `XDG_CONFIG_HOME` 时为 `~/.config/shadowlemon/client.yaml`（YAML，推荐） |
 | 环境变量覆盖 | `SHADOWLEMON_CLIENT_CONFIG_YAML_FILE`；`SHADOWLEMON_CLIENT_CONFIG_JSON_FILE` 用于旧的 JSON 文件 |
 
-字段名与格式见 `rust/docs/config-v0.2.md`。两种格式字段名相同；若同目录已有旧的 `client.json`，会继续使用它并提示迁移。如需从自定义路径加载配置（例如 OpenWrt 上的 `/etc/shadowlemon_client_config.yaml`），使用：
+字段名与格式见 `rust/docs/config-v0.2.md`。两种格式字段名相同；若同目录已有旧的 `client.json`，会继续使用它并提示迁移。如需从自定义路径加载配置（例如 `/etc/shadowlemon/client.yaml`），使用：
 
 ```sh
-SHADOWLEMON_CLIENT_CONFIG_YAML_FILE=/etc/shadowlemon_client_config.yaml shadowlemon client run
+SHADOWLEMON_CLIENT_CONFIG_YAML_FILE=/etc/shadowlemon/client.yaml shadowlemon client run
 ```
 
 ## 修改客户端的设置
