@@ -255,6 +255,11 @@ pub fn import_simple_url(url: &str) -> Result<ClientConfig> {
         if !protocol.is_known() {
             return Err(invalid(format!("unknown protocol '{protocol_text}'")));
         }
+        if protocol == TransportProtocol::Tcp {
+            return Err(invalid(
+                "TCP external transport has been removed; use protocol UDP",
+            ));
+        }
         let (port, port_range) = if port_text.contains('-') {
             if parse_port_range(port_text).is_none() {
                 return Err(invalid(format!("invalid port range '{port_text}'")));
@@ -367,7 +372,7 @@ mod tests {
                     "servers":[{
                         "domainName":"example.com",
                         "portBindings":[
-                            {"portRange":"2012-2022","protocol":"TCP"},
+                            {"portRange":"2012-2022","protocol":"UDP"},
                             {"port":2027,"protocol":"UDP"}
                         ]
                     }],
@@ -450,11 +455,22 @@ mod tests {
     }
 
     #[test]
+    fn simple_url_rejects_tcp_protocol() {
+        let url = export_simple_urls(&sample()).unwrap().remove(0);
+        let tcp_url = url.replace("protocol=UDP", "protocol=TCP");
+        let err = import_url(&tcp_url).unwrap_err().to_string();
+        assert!(
+            err.contains("TCP external transport has been removed; use protocol UDP"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn simple_url_rejects_port_protocol_count_mismatch() {
         let url = export_simple_urls(&sample()).unwrap().remove(0);
         let mut broken = url.clone();
         // Remove one protocol parameter, leaving two ports and one protocol.
-        broken = broken.replacen("&protocol=TCP", "", 1);
+        broken = broken.replacen("&protocol=UDP", "", 1);
         let err = import_simple_url(&broken).unwrap_err().to_string();
         assert!(err.contains("must match"), "{err}");
     }

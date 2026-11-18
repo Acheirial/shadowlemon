@@ -17,7 +17,6 @@ pub mod session;
 pub mod stream;
 pub mod underlay;
 pub mod underlay_packet;
-pub mod underlay_stream;
 
 pub use driver::{
     ClientCredential, RealClientConfig, RealClientHandshake, RealServerConfig, RealServerHandshake,
@@ -29,5 +28,5 @@ pub use handshake::{
 };
 pub use mux::{ClientMux, Endpoint, MuxConfig, ServerMux};
 pub use session::{Direction, Session, SessionConfig, SessionError, SessionState, TransportMode};
-pub use stream::TcpSessionStream;
+pub use stream::DatagramStream;
 pub use underlay::{Underlay, UnderlayError, UnderlayKind, UnderlayResult, WireCipher};

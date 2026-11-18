@@ -4,11 +4,13 @@
 
 ## 1. 结论摘要
 
-V0.2 的密码学设计是扎实的：TCP 上无明文 magic / 版本 / 类型 / 会话 ID，全部包头在 AEAD 内，nonce 真实随机，不存在 V0.1 的时间盐与 timestamp。但整改前存在三类结构性指纹：
+> **现状说明**：外部传输已是 **UDP-only**——TCP 端口绑定被配置校验拒绝，SOCKS5 CONNECT（TCP 目标）走 UDP 隧道的可靠层。本报告中的 TCP 抓包数据来自改造前的历史基线，用于对照；当前实际上线流量只有 UDP 数据报。USENIX'23 的 GFW 全加密检测器只针对 TCP 首包，对现在的 UDP-only 流量不再适用；但 QDPI 的 `entropy_score` 高熵分析依然成立（见 `gfw-assessment.md`）。
+
+V0.2 的密码学设计是扎实的：链路上无明文 magic / 版本 / 类型 / 会话 ID，全部包头在 AEAD 内，nonce 真实随机，不存在 V0.1 的时间盐与 timestamp。但整改前存在三类结构性指纹：
 
 1. **UDP 5 字节明文路由头**：`kind ∈ {1,2,3,4}` + 顺序递增会话 ID，构成可直接匹配、跨会话稳定的字节签名（P0）。
 2. **零填充 → 帧长确定**：所有帧 `prefixLen=suffixLen=0`，长度与载荷一一对应（P0）。
-3. **整个 `trafficPattern` 配置失效**：`seed`/`unlockAll`/`tcpFragment`/`padding`/`lowEntropy`/`dns` 乃至 `nonce.*` 都被解析校验，但从未进入真实数据路径——驱动在 `driver.rs` 构造 `StreamUnderlay` 后立刻 `into_inner()` 丢弃，握手用 `random_wire_nonce()`、数据面用 `random_nonce()`。这制造了严重的安全错觉（P0）。
+3. **整个 `trafficPattern` 配置失效**：`seed`/`unlockAll`/`tcpFragment`/`padding`/`lowEntropy`/`dns` 乃至 `nonce.*` 都被解析校验，但从未进入真实数据路径——历史 TCP 驱动在 `driver.rs` 构造 `StreamUnderlay` 后立刻 `into_inner()` 丢弃，握手用 `random_wire_nonce()`、数据面用 `random_nonce()`。这制造了严重的安全错觉（P0）。该配置字段现已从 schema 中整体删除；当前 UDP-only 传输下，数据面会话由 0-RTT early key 启动并在握手完成后 swap 到前向安全密钥（early data 无前向安全）。
 
 ## 2. 整改内容（已在 `7cfe986` 落地）
 
@@ -23,7 +25,9 @@ V0.2 的密码学设计是扎实的：TCP 上无明文 magic / 版本 / 类型 /
 
 ## 3. 实测对比数据
 
-### 3.1 TCP（60 条新连接，每条一个 HTTP 请求）
+### 3.1 TCP（历史基线：60 条新连接，每条一个 HTTP 请求）
+
+> 该场景属于改造前的外部 TCP 传输，当前版本已不再产生 TCP 外部连接；数据保留作对照。
 
 | 指标 | 整改前 | 整改后 |
 |---|---|---|
@@ -50,7 +54,7 @@ V0.2 的密码学设计是扎实的：TCP 上无明文 magic / 版本 / 类型 /
 
 ## 3.3 nDPI 6.0 检测测试
 
-对四份 pcap（TCP/UDP × 整改前后）运行 `ndpiReader`：
+对四份历史 pcap（TCP/UDP × 整改前后）运行 `ndpiReader`（当前版本只有 UDP 流量，TCP 行仅作对照）：
 
 | 场景 | 流数 | nDPI 判定 | 置信度来源 | `Susp Entropy` 风险 |
 |---|---|---|---|---|
@@ -67,7 +71,7 @@ V0.2 的密码学设计是扎实的：TCP 上无明文 magic / 版本 / 类型 /
 
 ## 4. 残余指纹（未闭环）
 
-1. **握手响应定长**：TCP 115 字节 / UDP 144 字节，因客户端读取端依赖定长约定；需改为先读 48 字节元数据、解密取长度后再读变长部分。
+1. **握手响应定长**：当前 UDP 响应恒 144 字节，因客户端读取端依赖定长约定；需改为先读 48 字节元数据、解密取长度后再读变长部分。（历史 TCP 115 字节响应已随 TCP 外部传输移除。）
 2. **重传逐字节相同**：`session.rs` 重传复用同一密文帧；可用新 nonce 重加密或追加随机填充。
 3. **心跳时序**：空闲 TCP 每 3–14 秒发空 ACK，空闲 UDP 不发；可被时序分类识别。
 4. **UDP `kind` 混淆不是加密**：协议感知的观察者仍可用会话 ID 反推消息类型；真正的路由元数据保密需要握手协商密钥。

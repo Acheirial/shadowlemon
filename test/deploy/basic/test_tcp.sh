@@ -23,5 +23,7 @@ set -e
 # Load test library.
 source ./libtest.sh
 
-# Test socks5 proxy with TCP config.
+# Test SOCKS5 CONNECT over the UDP tunnel. The config file uses UDP-only port
+# bindings; TCP targets are carried over the tunnel's reliable DatagramStream
+# layer. The script name is kept for compatibility.
 run_socks5_test TCP server_tcp.json client_tcp.json client_tcp_no_wait.json

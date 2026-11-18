@@ -23,7 +23,6 @@ use shadowlemon_protocol::{
     mux::{Multiplexing, MuxConfig},
     underlay::{IpFamily, NoncePattern, NoncePatternConfig},
     underlay_packet::PacketConfig,
-    underlay_stream::StreamConfig,
     ClientCredential, RealClientConfig, RealServerConfig,
 };
 use shadowlemon_socks5::{Credential, EgressAction, EgressConfig, EgressProxy, EgressRule};
@@ -207,10 +206,6 @@ pub fn client_driver_config(profile: &ClientProfile) -> Result<RealClientConfig,
         username: name.to_owned(),
         credential,
         suites,
-        stream: StreamConfig {
-            nonce_pattern: nonce.clone(),
-            nonce_pattern_config: nonce_config,
-        },
         packet: PacketConfig {
             mtu,
             family: IpFamily::V4,
@@ -288,10 +283,6 @@ pub fn server_driver_config(config: &ServerConfig) -> Result<RealServerConfig, A
             .unwrap_or(true),
         allowed_suites: suites,
         egress: egress_config(config.egress.as_ref())?,
-        stream: StreamConfig {
-            nonce_pattern: nonce.clone(),
-            nonce_pattern_config: nonce_config,
-        },
         packet: PacketConfig {
             mtu,
             family: IpFamily::V4,

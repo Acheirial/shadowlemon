@@ -12,11 +12,11 @@
                     "portBindings": [
                         {
                             "portRange": "9999-9999",
-                            "protocol": "TCP"
+                            "protocol": "UDP"
                         },
                         {
                             "port": 10001,
-                            "protocol": "TCP"
+                            "protocol": "UDP"
                         },
                         {
                             "port": 10002,

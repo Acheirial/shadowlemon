@@ -9,8 +9,8 @@
 //! The length is placed first so different-length messages cannot collide,
 //! and the full 24-byte nonce is covered so a fixed traffic-pattern prefix
 //! still leaves ample entropy. Note that V0.2 uses a **32-bit** length prefix
-//! and domains `0/1/2`; the Go V0.1 reference used a 64-bit length and domains
-//! `1/2/3`. The spec is authoritative here.
+//! and UDP domains `1/2`; the Go V0.1 reference used a 64-bit length and
+//! domains `1/2/3`. The spec is authoritative here.
 
 use crate::{WireError, WireNonce, WIRE_NONCE_LEN};
 
@@ -25,8 +25,6 @@ pub const REPLAY_SIGNATURE_INPUT_LEN: usize = 4 + 1 + WIRE_NONCE_LEN;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ReplayDomain {
-    /// TCP byte stream.
-    Stream = 0,
     /// UDP client-to-server datagrams.
     UdpClientToServer = 1,
     /// UDP server-to-client datagrams.
@@ -34,7 +32,7 @@ pub enum ReplayDomain {
 }
 
 impl ReplayDomain {
-    /// Wire value of this domain (`0`, `1` or `2`).
+    /// Wire value of this domain (`1` or `2`).
     #[must_use]
     pub const fn as_u8(self) -> u8 {
         self as u8
@@ -84,41 +82,37 @@ mod tests {
 
     #[test]
     fn signature_golden_vector() {
-        // m = u32be(72) || 0x00 || 0x42 * 24, hashed independently.
+        // m = u32be(72) || 0x01 || 0x42 * 24, hashed independently.
         assert_eq!(
-            replay_signature(72, ReplayDomain::Stream, &[0x42; 24]).unwrap(),
-            0x6c9d_58e6_6ab2_4d57
+            replay_signature(72, ReplayDomain::UdpClientToServer, &[0x42; 24]).unwrap(),
+            0x4bd6_ad18_f957_8274
         );
     }
 
     #[test]
     fn signature_is_domain_and_length_separated() {
         let nonce = [7u8; 24];
-        let base = replay_signature(72, ReplayDomain::Stream, &nonce).unwrap();
-        assert_ne!(
-            base,
-            replay_signature(72, ReplayDomain::UdpClientToServer, &nonce).unwrap()
-        );
+        let base = replay_signature(72, ReplayDomain::UdpClientToServer, &nonce).unwrap();
         assert_ne!(
             base,
             replay_signature(72, ReplayDomain::UdpServerToClient, &nonce).unwrap()
         );
         assert_ne!(
             base,
-            replay_signature(73, ReplayDomain::Stream, &nonce).unwrap()
+            replay_signature(73, ReplayDomain::UdpClientToServer, &nonce).unwrap()
         );
         let mut other = nonce;
         other[23] ^= 1;
         assert_ne!(
             base,
-            replay_signature(72, ReplayDomain::Stream, &other).unwrap()
+            replay_signature(72, ReplayDomain::UdpClientToServer, &other).unwrap()
         );
     }
 
     #[test]
     fn signature_rejects_length_overflow() {
         assert_eq!(
-            replay_signature(usize::MAX, ReplayDomain::Stream, &[0; 24]).unwrap_err(),
+            replay_signature(usize::MAX, ReplayDomain::UdpClientToServer, &[0; 24]).unwrap_err(),
             WireError::InputLengthTooLarge(usize::MAX)
         );
     }

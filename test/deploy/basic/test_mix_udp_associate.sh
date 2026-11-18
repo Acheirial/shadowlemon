@@ -84,15 +84,15 @@ if [[ "$client_status" != *RUNNING* ]]; then
     exit 1
 fi
 
-# Start testing.
+# Start testing. All port bindings are UDP: the external transport is UDP-only.
 sleep 1
-echo ">>> socks5 UDP associate - TCP and UDP <<<"
+echo ">>> socks5 UDP associate over UDP transport <<<"
 ./socksudpclient -dst_host=127.0.0.1 -dst_port=9090 \
   -local_proxy_host=127.0.0.1 -local_proxy_port=1080 \
   -interval_ms=10 -num_request=100 -num_conn=60
 if [ "$?" -ne "0" ]; then
     print_client_log
-    echo "Test UDP associate - TCP and UDP failed."
+    echo "Test UDP associate over UDP transport failed."
     exit 1
 fi
 

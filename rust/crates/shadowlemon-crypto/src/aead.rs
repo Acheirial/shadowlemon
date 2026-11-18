@@ -33,23 +33,6 @@ pub fn udp_payload_nonce(metadata_nonce: &WireNonce) -> WireNonce {
     derived
 }
 
-/// Derive the wire nonce used to protect a TCP payload in implicit-nonce mode:
-/// add one to the 24-byte metadata nonce, treating it as a big-endian integer.
-/// The first TCP segment uses the metadata nonce; each subsequent one is
-/// incremented by one.
-#[must_use]
-pub fn tcp_payload_nonce(metadata_nonce: &WireNonce) -> WireNonce {
-    let mut derived = *metadata_nonce;
-    for byte in derived.iter_mut().rev() {
-        let (next, carry) = byte.overflowing_add(1);
-        *byte = next;
-        if !carry {
-            break;
-        }
-    }
-    derived
-}
-
 /// Convert a byte slice to the nonce type of an AEAD algorithm, with a
 /// checked length so malformed inputs are reported instead of panicking.
 fn checked_nonce<A: Aead>(nonce: &[u8]) -> Result<Nonce<A>, CryptoError> {
@@ -252,24 +235,6 @@ impl AeadKey {
     ) -> Result<Vec<u8>, CryptoError> {
         self.open(&udp_payload_nonce(metadata_nonce), ciphertext)
     }
-
-    /// Seal a TCP payload with the implicitly incremented nonce.
-    pub fn seal_tcp_payload(
-        &self,
-        metadata_nonce: &WireNonce,
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
-        self.seal(&tcp_payload_nonce(metadata_nonce), plaintext)
-    }
-
-    /// Open a TCP payload with the implicitly incremented nonce.
-    pub fn open_tcp_payload(
-        &self,
-        metadata_nonce: &WireNonce,
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
-        self.open(&tcp_payload_nonce(metadata_nonce), ciphertext)
-    }
 }
 
 #[cfg(test)]
@@ -313,15 +278,6 @@ mod tests {
         assert_eq!(udp[..16], metadata[..16]);
         assert_eq!(udp[17..], metadata[17..]);
         assert_eq!(udp_payload_nonce(&udp), metadata);
-
-        let mut tcp = [0u8; 24];
-        tcp[23] = 0xff;
-        let next = tcp_payload_nonce(&tcp);
-        assert_eq!(next[23], 0);
-        assert_eq!(next[22], 1);
-        let almost = [0xffu8; 24];
-        assert_eq!(tcp_payload_nonce(&almost), [0u8; 24]);
-        assert_eq!(tcp_payload_nonce(&metadata)[23], 0x11);
     }
 
     /// RFC 8439 section 2.8.2, ChaCha20-Poly1305 with AAD.
@@ -455,9 +411,6 @@ mod tests {
             let mut tampered = sealed.clone();
             tampered[0] ^= 1;
             assert!(cipher.open_payload(&nonce, &tampered).is_err());
-
-            let tcp = cipher.seal_tcp_payload(&nonce, b"payload").unwrap();
-            assert_eq!(cipher.open_tcp_payload(&nonce, &tcp).unwrap(), b"payload");
         }
     }
 

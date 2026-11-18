@@ -7,7 +7,7 @@
 use std::{collections::HashSet, net::IpAddr, str::FromStr};
 
 use crate::{
-    enums::{CipherSuite, EgressAction, KnownEnum},
+    enums::{CipherSuite, EgressAction, KnownEnum, TransportProtocol},
     error::{ConfigError, Result},
     schema::{
         is_valid_port, parse_port_range, Auth, ClientConfig, ClientDialer, ClientProfile, Egress,
@@ -89,7 +89,14 @@ fn validate_user(user: &User, path: &str) -> Result<()> {
 }
 
 fn validate_binding(binding: &PortBinding, path: &str) -> Result<()> {
-    check_enum(&binding.protocol, &format!("{path}.protocol"))?;
+    let protocol_path = format!("{path}.protocol");
+    check_enum(&binding.protocol, &protocol_path)?;
+    if binding.protocol == TransportProtocol::Tcp {
+        return Err(invalid(
+            protocol_path,
+            "TCP external transport has been removed; use protocol UDP",
+        ));
+    }
     match (&binding.port, &binding.port_range) {
         (Some(_), Some(_)) => Err(invalid(path, "port and portRange are mutually exclusive")),
         (Some(port), None) => {
@@ -403,7 +410,7 @@ mod tests {
                 "profiles":[{
                     "profileName":"default",
                     "user":{"name":"u","password":"p"},
-                    "servers":[{"ipAddress":"1.2.3.4","portBindings":[{"port":443,"protocol":"TCP"}]}],
+                    "servers":[{"ipAddress":"1.2.3.4","portBindings":[{"port":443,"protocol":"UDP"}]}],
                     "mtu":1400,
                     "cipherSuites":["CIPHER_SUITE_XCHACHA20_POLY1305"]
                 }],
@@ -416,6 +423,18 @@ mod tests {
     #[test]
     fn valid_client_passes() {
         client().validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_tcp_binding() {
+        let mut cfg = client();
+        cfg.profiles[0].servers[0].port_bindings[0].protocol = TransportProtocol::Tcp;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("TCP external transport has been removed; use protocol UDP"),
+            "{err}"
+        );
+        assert!(err.contains("portBindings[0].protocol"), "{err}");
     }
 
     #[test]

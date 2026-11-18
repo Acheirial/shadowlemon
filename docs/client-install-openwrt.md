@@ -1,6 +1,8 @@
 # 客户端安装与配置 - OpenWrt
 
 > **本版本线协议版本为 4；两端必须使用同一版本，否则会话会在握手阶段失败。**
+>
+> 外部传输为 UDP-only：客户端配置的端口绑定只能用 `"protocol": "UDP"`；SOCKS5 CONNECT（TCP 目标）走 UDP 隧道可靠层，握手为 0-RTT（early data 无前向安全）。
 
 OpenWrt 是一个极简 Linux 环境，在 OpenWrt 环境运行 shadowlemon 客户端软件需要额外的步骤。请参照[客户端安装与配置](./client-install.md)，同时按照这里的提示安装和配置 shadowlemon 客户端。
 

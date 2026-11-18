@@ -17,6 +17,12 @@
 
 # Every shadowlemon invocation below uses TEST_BINARY, which defaults to the
 # Rust binary copied into /test as ./shadowlemon.
+#
+# External transport is UDP-only. The <TCP|UDP> labels below are legacy
+# scenario tags kept for compatibility: they now describe the SOCKS5 request
+# being exercised, not the external transport. "TCP" means SOCKS5 CONNECT
+# (TCP targets carried over the UDP tunnel's reliable DatagramStream layer);
+# "UDP" means UDP ASSOCIATE datagrams (PacketUnderlay). Both use UDP bindings.
 TEST_BINARY=${TEST_BINARY:-./shadowlemon}
 
 # The Rust daemon redirects stdout/stderr to /dev/null. Scenarios that inspect
@@ -138,7 +144,9 @@ function dump_client_log() {
     sleep 1
 }
 
-# run_socks5_new_conn <TCP|UDP>
+# run_socks5_new_conn <CONNECT|UDP associate>
+# The label is a scenario tag: CONNECT (TCP targets) is carried over a reliable
+# stream inside the UDP tunnel; UDP associate is carried as UDP datagrams.
 function run_socks5_new_conn() {
     local label=$1
 
@@ -154,7 +162,8 @@ function run_socks5_new_conn() {
     fi
 }
 
-# run_socks5_reuse_conn <TCP|UDP>
+# run_socks5_reuse_conn <CONNECT|UDP associate>
+# The label is a scenario tag; both variants reuse a session over UDP transport.
 function run_socks5_reuse_conn() {
     local label=$1
 
@@ -170,7 +179,9 @@ function run_socks5_reuse_conn() {
     fi
 }
 
-# run_socks5_new_conn_no_wait <TCP|UDP>
+# run_socks5_new_conn_no_wait <CONNECT|UDP associate>
+# Exercises the no-wait (0-RTT) configuration: the client returns the stream
+# immediately and gates the first read/write on the forward-secret key swap.
 function run_socks5_new_conn_no_wait() {
     local label=$1
 
@@ -188,12 +199,15 @@ function run_socks5_new_conn_no_wait() {
 
 # run_socks5_test <TCP|UDP> <server config> <client config> <client config with handshake no wait>
 # Runs all the socks5 test stages of test_tcp.sh and test_udp.sh. The only
-# difference between these two tests is the configuration files, and the label
-# used in the log output. The test exits with a non-zero code when any stage
-# fails.
+# difference between these two tests is the configuration files and the label
+# used in the log output. The label is a SOCKS5 scenario tag kept for
+# compatibility: "TCP" denotes SOCKS5 CONNECT (TCP targets carried over the UDP
+# tunnel's reliable layer), "UDP" denotes UDP associate datagrams. It does not
+# select an external transport — every binding in these configs is UDP. The
+# test exits with a non-zero code when any stage fails.
 function run_socks5_test() {
     if [[ $# -ne 4 ]]; then
-        echo "usage: run_socks5_test <TCP|UDP> <server config> <client config> <client config with handshake no wait>"
+        echo "usage: run_socks5_test <CONNECT|UDP-associate label> <server config> <client config> <client config with handshake no wait>"
         exit 1
     fi
     local label=$1

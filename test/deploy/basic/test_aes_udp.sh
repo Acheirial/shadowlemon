@@ -23,23 +23,23 @@ set -e
 # Load test library.
 source ./libtest.sh
 
-# Test the AES-256-GCM cipher suite over the UDP transport, with the socks5 UDP
-# associate data plane of test_mix_udp_associate.sh.
+# Test the AES-256-GCM cipher suite over the UDP-only transport, with the socks5
+# UDP associate data plane of test_mix_udp_associate.sh.
 #
-# server_aes_udp.json is a mixed listener: it binds the TCP ports 9999-10001 and
-# the UDP ports 10002-10003, and it only allows CIPHER_SUITE_AES_256_GCM.
-# client_aes_udp.json offers CIPHER_SUITE_AES_256_GCM and the
-# CIPHER_SUITE_XCHACHA20_POLY1305 fallback, and it selects the UDP port bindings
-# of the server only. Every session of this test therefore runs over the UDP
-# transport (a PacketUnderlay), so a successful run proves the AES-256-GCM suite
-# end to end over UDP rather than over TCP as test_aes.sh does.
+# External transport is UDP-only: every port binding in server_aes_udp.json and
+# client_aes_udp.json is a UDP binding. server_aes_udp.json only allows
+# CIPHER_SUITE_AES_256_GCM. client_aes_udp.json offers CIPHER_SUITE_AES_256_GCM
+# and the CIPHER_SUITE_XCHACHA20_POLY1305 fallback. Every session of this test
+# therefore runs as a UDP-associate datagram session (a PacketUnderlay), so a
+# successful run proves the AES-256-GCM suite end to end over UDP.
 #
-# The negotiated suite is observable in the client log: when a session is
-# attached to an underlay the Rust driver logs at DEBUG level
-# "TCP session established to StreamUnderlay{" or
-# "UDP session established to PacketUnderlay{", with a `suite=<name>` field on
-# the same line (rust/crates/shadowlemon-protocol/src/driver.rs). The underlay
-# name tells the transport apart: PacketUnderlay is UDP, StreamUnderlay is TCP.
+# The negotiated suite is observable in the client log: the Rust driver logs at
+# DEBUG level "UDP session established to PacketUnderlay{" with a `suite=<name>`
+# field on the same line (rust/crates/shadowlemon-protocol/src/driver.rs). For
+# SOCKS5 CONNECT the driver instead logs "UDP stream session opened to
+# StreamUnderlay{" (no suite field) plus "UDP stream handshake completed" with
+# the suite once the forward-secret key swap finishes. This scenario only uses
+# UDP associate, so the PacketUnderlay line is the relevant one.
 # client_aes_udp.json therefore sets "loggingLevel": "DEBUG"; with the "INFO"
 # level used by client_udp.json the line is never emitted. start_client in
 # libtest.sh runs the client in the foreground and captures its log in
@@ -86,10 +86,11 @@ function print_client_log_tail() {
 
 # assert_aes_cipher_suite_over_udp
 # Fails the test unless at least one established session logged that it used
-# AES-256-GCM, and unless at least one session was attached to a UDP transport
+# AES-256-GCM, and unless at least one session was attached to a UDP datagram
 # underlay. An "apparently working" data plane is NOT enough: a silent fallback
-# to CIPHER_SUITE_XCHACHA20_POLY1305 would still carry traffic, and a session
-# that ran over the TCP transport would still transfer the same payloads.
+# to CIPHER_SUITE_XCHACHA20_POLY1305 would still carry traffic. The external
+# transport is UDP-only, so StreamUnderlay (the CONNECT reliable layer) is only
+# reported as a sanity check and is never expected in this UDP-associate test.
 function assert_aes_cipher_suite_over_udp() {
     local session_count
     local aes_packet_count
@@ -100,8 +101,8 @@ function assert_aes_cipher_suite_over_udp() {
     aes_stream_count=$(count_aes_sessions "$STREAM_UNDERLAY_LINE")
 
     echo "session assertion: $session_count session(s) were established."
-    echo "transport assertion: $aes_packet_count AES session(s) used UDP (PacketUnderlay) and"
-    echo "transport assertion: $aes_stream_count AES session(s) used TCP (StreamUnderlay)."
+    echo "transport assertion: $aes_packet_count AES session(s) used the UDP datagram layer (PacketUnderlay) and"
+    echo "transport assertion: $aes_stream_count AES session(s) used the CONNECT stream layer (StreamUnderlay)."
 
     if [[ "$session_count" -eq 0 ]]; then
         echo "session assertion FAILED: no client log line reports an established session at all,"
@@ -128,9 +129,9 @@ function assert_aes_cipher_suite_over_udp() {
         exit 1
     fi
 
-    echo "cipher suite assertion passed: $aes_packet_count AES session(s) used the UDP transport."
+    echo "cipher suite assertion passed: $aes_packet_count AES session(s) used the UDP datagram layer."
     if [[ "$aes_stream_count" -gt 0 ]]; then
-        echo "note: $aes_stream_count AES session(s) also used the TCP transport."
+        echo "note: $aes_stream_count AES session(s) also used the CONNECT-over-UDP stream layer."
     fi
     grep -h -F "$PACKET_UNDERLAY_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | grep -F "$AES_SUITE" | head -n 3 || true
 }

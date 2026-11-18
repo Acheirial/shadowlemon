@@ -61,7 +61,7 @@
 | `mtu` | `int32` | 否 | 实现默认 | L3 MTU，取值 `1280..1500`（UDP egress 用） |
 | `multiplexing` | `MultiplexingConfig` | 否 | 见枚举 | 复用行为 |
 | `handshakeMode` | `HandshakeMode` | 否 | `HANDSHAKE_DEFAULT` | 建连握手模式 |
-| `dialer` | `ClientDialer` | 否 | 空 | 连接服务端前经过的前置代理 |
+| `dialer` | `ClientDialer` | 否 | 空 | 连接服务端前经过的前置代理；与 UDP-only 外部传输不兼容（上游 socks5 UDP ASSOCIATE 未实现），见 §3.2 |
 | `cipherSuites` | `CipherSuite[]` | 否 | 空→仅 XChaCha20-Poly1305 | 客户端首选套件（枚举字符串），顺序即偏好 |
 
 ### 3.2 ClientDialer
@@ -74,11 +74,13 @@
 | `socks5UDPAssociate` | `bool` | UDP underlay 是否走 socks5 UDP ASSOCIATE |
 | `socks5Authentication` | `Auth` | socks5 代理认证凭据（非 socks5 时忽略） |
 
+> **UDP-only 不兼容**：外部传输现已只支持 UDP，而前置 socks5 代理的 UDP ASSOCIATE 尚未实现（返回明确的 "unsupported" 错误）。因此 `dialer` 无法用于连接服务端，`configs/examples/client_config_with_dialer.json` 已移除该块作为 UDP-only 示例。该字段保留在 schema 中只是为了兼容旧配置的加载，不应在新配置中使用。
+
 ### 3.3 ServerEndpoint / PortBinding
 
 `ServerEndpoint`：`ipAddress`（string）、`domainName`（string，设置时忽略 `ipAddress`）、`portBindings`（PortBinding[]）。
 
-`PortBinding`：`port`（int32，单端口）、`portRange`（string，如 `"2012-2022"`）、`protocol`（TransportProtocol）。`port` 与 `portRange` 互斥，不可同时设置。
+`PortBinding`：`port`（int32，单端口）、`portRange`（string，如 `"2012-2022"`）、`protocol`（TransportProtocol）。`port` 与 `portRange` 互斥，不可同时设置。`protocol` 在 V0.2 中**只能为 `UDP`**：TCP 外部传输已移除，设置为 `TCP` 会在校验阶段被拒绝（"TCP external transport has been removed; use protocol UDP"）。SOCKS5 CONNECT（TCP 目标）通过 UDP 隧道的可靠层承载，不需要 TCP 外部绑定。
 
 ---
 
@@ -143,10 +145,10 @@ V0.1 中该消息的两个旧字段 `allowLocalDestination`（字段号 1）与 
 | 枚举 | 合法字符串值 |
 | :-- | :-- |
 | `LoggingLevel` | `DEFAULT`, `FATAL`, `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE` |
-| `TransportProtocol` | `UNKNOWN_TRANSPORT_PROTOCOL`, `UDP`, `TCP` |
+| `TransportProtocol` | `UNKNOWN_TRANSPORT_PROTOCOL`, `UDP`（唯一合法外部传输）, `TCP`（**已移除/被校验拒绝**） |
 | `ProxyProtocol` | `UNKNOWN_PROXY_PROTOCOL`, `SOCKS5_PROXY_PROTOCOL` |
 | `MultiplexingLevel` | `MULTIPLEXING_DEFAULT`, `MULTIPLEXING_OFF`, `MULTIPLEXING_LOW`, `MULTIPLEXING_MIDDLE`, `MULTIPLEXING_HIGH` |
-| `HandshakeMode` | `HANDSHAKE_DEFAULT`, `HANDSHAKE_STANDARD`（1-RTT）, `HANDSHAKE_NO_WAIT`（0-RTT 式 piggyback） |
+| `HandshakeMode` | `HANDSHAKE_DEFAULT`, `HANDSHAKE_STANDARD`, `HANDSHAKE_NO_WAIT` —— 三者现在都使用 0-RTT（首包 piggyback + early key）；数据面读写被 gate 直到前向安全 key swap 完成，early data 无前向安全 |
 | `EgressAction` | `PROXY`, `DIRECT`, `REJECT` |
 | `CipherSuite` | 见 §2 映射表（`CIPHER_SUITE_UNSPECIFIED` 非法） |
 
@@ -205,6 +207,7 @@ pub struct ClientProfile {
 6. **Egress**：`action=PROXY` 时 `proxyNames` 非空，且每个名字都能解析到某个 `EgressProxy.name`。
 7. **`activeProfile`**：若非空，须匹配某个 `profileName`。
 8. **`hashedPassword`**：若为 hex，长度须为偶数且可解码（建议 32 字节 SHA-256）。
+9. **外部传输协议**：任何 `portBinding.protocol` 为 `TCP` 的绑定都以 "TCP external transport has been removed; use protocol UDP" 错误拒绝；仅 `UDP` 合法。
 
 已删除的 `trafficPattern` 与 `dns` 不再校验；它们作为未知字段被忽略。
 
@@ -262,7 +265,7 @@ shadowlemons://<user>:<password>@<host>/?<query>
 | `handshake-mode` | `handshakeMode` | 枚举名，如 `HANDSHAKE_NO_WAIT` |
 | `cipher-suites` | `cipherSuites` | 枚举名逗号分隔，如 `CIPHER_SUITE_AES_256_GCM,CIPHER_SUITE_XCHACHA20_POLY1305` |
 | `port` | 每个 `portBindings[].portRange` 或 `port` | 可重复，与 `protocol` 一一对应 |
-| `protocol` | 每个 `portBindings[].protocol` | 可重复，如 `TCP`、`UDP` |
+| `protocol` | 每个 `portBindings[].protocol` | 可重复；V0.2 仅允许 `UDP`，`TCP` 会被校验拒绝 |
 
 - **导入**：解析 scheme 必须为 `shadowlemons`；要求 user/password/host/`profile` 齐全；`cipher-suites` 中每个名称须能解析到合法 `CipherSuite`（未知名称报错，不得静默回退默认套件，见 protocol-v0.2.md §3.5）；`port` 与 `protocol` 数量必须一致；端口/portRange 校验同 §8。
 - 导出时若 `profileName`/用户名/密码/服务器/端口绑定缺失，应报错而非生成不完整链接。
@@ -293,7 +296,7 @@ JSON 字段名 **全部保留**，无需改名。下表给出完整对照并标�
 | `ClientProfile.servers` | `servers` | 不变 |
 | `ClientProfile.mtu` | `mtu` | 不变；语义为 L3 MTU，`1280..1500` |
 | `ClientProfile.multiplexing.level` | `multiplexing.level` | 不变 |
-| `ClientProfile.handshakeMode` | `handshakeMode` | 不变；V0.2 握手固定 1-RTT，但允许应用数据 piggyback |
+| `ClientProfile.handshakeMode` | `handshakeMode` | 不变；V0.2 所有模式都使用 0-RTT 首包 piggyback（early key），数据面 I/O gated 到前向安全 key swap 完成，early data 无前向安全 |
 | `ClientProfile.trafficPattern` | — | **已删除，不再实现**（配置从未接入数据面） |
 | `ClientProfile.dialer` | `dialer` | 不变 |
 | `ClientProfile.cipherSuites` | `cipherSuites` | 字段名不变；枚举名不变；**映射到新的线套件号 0/1/2（见 §2）** |
@@ -329,3 +332,5 @@ JSON 字段名 **全部保留**，无需改名。下表给出完整对照并标�
 | `apply/replace/describe` | 合并补丁 / 整体替换 / 查看 | 语义保持一致 |
 | URL scheme | `shadowlemon://`（protobuf+base64）、`shadowlemons://`（手工 query） | 保持一致；未知套件名必须报错 |
 | 已删除字段 | 见 §11 | 不实现；遇到这些字段时宽松忽略 |
+| 外部传输 | TCP 或 UDP 端口绑定 | **仅 UDP**；TCP 绑定在校验阶段被拒绝，SOCKS5 CONNECT 走 UDP 隧道可靠层 |
+| 握手模式 | `HANDSHAKE_NO_WAIT` 为 0-RTT，其余 1-RTT | 所有模式均为 0-RTT（early key + piggyback），数据面 I/O gated 到前向安全 key swap 完成；early data 无前向安全 |

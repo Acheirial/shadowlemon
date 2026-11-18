@@ -23,15 +23,22 @@ set -e
 # Load test library.
 source ./libtest.sh
 
-# Test socks5 proxy with a configuration that forces the AES-256-GCM cipher
-# suite. server_aes.json only allows CIPHER_SUITE_AES_256_GCM, and
-# client_aes.json prefers it and falls back to CIPHER_SUITE_XCHACHA20_POLY1305,
-# so a successful session must have negotiated AES-256-GCM.
+# Test SOCKS5 CONNECT over the UDP tunnel with a configuration that forces the
+# AES-256-GCM cipher suite. server_aes.json only allows
+# CIPHER_SUITE_AES_256_GCM, and client_aes.json prefers it and falls back to
+# CIPHER_SUITE_XCHACHA20_POLY1305, so a successful session must have negotiated
+# AES-256-GCM.
 #
-# The negotiation result is observable in the client log: when a session is
-# attached to the TCP transport the Rust driver logs, at DEBUG level,
-# "TCP session established to StreamUnderlay{" with a `suite=<name>` field on
-# the same line (rust/crates/shadowlemon-protocol/src/driver.rs).
+# The external transport is UDP-only. CONNECT (TCP targets) is carried over a
+# reliable DatagramStream inside the UDP tunnel. The negotiated suite is
+# observable in the client log: the Rust driver logs, at DEBUG level,
+# "UDP stream session opened to StreamUnderlay{" when it returns the CONNECT
+# stream, and "UDP stream handshake completed" with a `suite=<name>` field on
+# the same line once the forward-secret key swap finishes
+# (rust/crates/shadowlemon-protocol/src/driver.rs). The "to StreamUnderlay{"
+# line itself carries no suite field, so the suite assertion below matches the
+# "UDP stream handshake completed" line instead.
+#
 # client_aes.json therefore sets "loggingLevel": "DEBUG"; with the "INFO" level
 # used by client_tcp.json the line is never emitted. start_client in libtest.sh
 # runs the client in the foreground and captures its log in
@@ -41,8 +48,8 @@ source ./libtest.sh
 # of a rejection, but nothing when a handshake succeeds. server_aes.json is set
 # to DEBUG as well so that a rejection is visible in the container output.
 AES_SUITE="AES_256_GCM"
-STREAM_UNDERLAY_LINE="to StreamUnderlay{"
-SESSION_ESTABLISHED_LINE="session established to"
+STREAM_OPENED_LINE="to StreamUnderlay{"
+STREAM_HANDSHAKE_LINE="UDP stream handshake completed"
 
 # count_client_log_matches <substring>
 # Prints how many lines of the client log contain the given substring.
@@ -57,12 +64,12 @@ function count_client_log_matches() {
 }
 
 # count_aes_stream_sessions
-# Number of established TCP sessions whose log line also carries the
-# AES_256_GCM suite field.
+# Number of CONNECT-over-UDP streams whose key-swap completion line also
+# carries the AES_256_GCM suite field.
 function count_aes_stream_sessions() {
     local count
 
-    count=$(grep -h -F "$STREAM_UNDERLAY_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | grep -F -c "$AES_SUITE" || true)
+    count=$(grep -h -F "$STREAM_HANDSHAKE_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | grep -F -c "$AES_SUITE" || true)
     echo "$((count))"
 }
 
@@ -76,35 +83,39 @@ function print_client_log_tail() {
 }
 
 # assert_aes_cipher_suite_negotiated
-# Fails the test unless at least one established session logged that it used
-# AES-256-GCM. An "apparently working" data plane is NOT enough: a silent
-# fallback to CIPHER_SUITE_XCHACHA20_POLY1305 would still carry traffic, and
-# this assertion is what tells the two cases apart.
+# Fails the test unless at least one CONNECT-over-UDP stream logged that its
+# key swap completed with AES-256-GCM. An "apparently working" data plane is
+# NOT enough: a silent fallback to CIPHER_SUITE_XCHACHA20_POLY1305 would still
+# carry traffic, and this assertion is what tells the two cases apart.
 function assert_aes_cipher_suite_negotiated() {
     local aes_count
     local session_count
+    local opened_count
 
     aes_count=$(count_aes_stream_sessions)
-    session_count=$(count_client_log_matches "$SESSION_ESTABLISHED_LINE")
+    session_count=$(count_client_log_matches "$STREAM_HANDSHAKE_LINE")
+    opened_count=$(count_client_log_matches "$STREAM_OPENED_LINE")
 
     if [[ "$aes_count" -gt 0 ]]; then
-        echo "cipher suite assertion passed: $aes_count session(s) negotiated AES_256_GCM."
-        grep -h -F "$STREAM_UNDERLAY_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | grep -F "$AES_SUITE" | head -n 3 || true
+        echo "cipher suite assertion passed: $aes_count CONNECT-over-UDP stream(s) negotiated AES_256_GCM."
+        grep -h -F "$STREAM_HANDSHAKE_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | grep -F "$AES_SUITE" | head -n 3 || true
         return 0
     fi
 
-    echo "cipher suite assertion FAILED: none of the $session_count established session(s) used AES_256_GCM."
+    echo "cipher suite assertion FAILED: none of the $session_count completed stream handshake(s) used AES_256_GCM."
+    echo "$opened_count CONNECT stream(s) were opened to StreamUnderlay{ (the log line itself has no suite field)."
     if [[ "$session_count" -gt 0 ]]; then
-        echo "the sessions were established with a different cipher suite:"
-        grep -h -F "$SESSION_ESTABLISHED_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | head -n 3 || true
+        echo "the streams were established with a different cipher suite:"
+        grep -h -F "$STREAM_HANDSHAKE_LINE" "$CLIENT_LOG_DIR"/*.log 2>/dev/null | head -n 3 || true
         echo "a XCHACHA20_POLY1305 suite above means the client fell back to the default suite"
         echo "instead of using the AES-256-GCM suite both configurations ask for."
     else
-        echo "no client log line reports an established session at all, so the session either"
-        echo "wasn't established or the client didn't log at DEBUG level."
+        echo "no client log line reports a completed stream key swap at all, so the handshake either"
+        echo "failed before the key swap (see 'no common cipher suite with the server') or the client"
+        echo "didn't log at DEBUG level."
     fi
     echo "the expected log line is written by rust/crates/shadowlemon-protocol/src/driver.rs:"
-    echo "  TCP session established to StreamUnderlay{ ... suite=AES_256_GCM ..."
+    echo "  UDP stream handshake completed ... suite=AES_256_GCM ..."
     echo "help: check that server_aes.json sets cipherSuites to CIPHER_SUITE_AES_256_GCM,"
     echo "help: that client_aes.json sets profiles[0].cipherSuites and \"loggingLevel\": \"DEBUG\","
     echo "help: that the server allows a suite the client offers, and that the log doesn't"
@@ -114,13 +125,13 @@ function assert_aes_cipher_suite_negotiated() {
     exit 1
 }
 
-# Run the AES-256-GCM test over TCP.
+# Run the AES-256-GCM test over the UDP tunnel (SOCKS5 CONNECT).
 apply_server_config server_aes.json
 start_server
 apply_client_config client_aes.json
 start_client
 
-# Data plane: run the same socks5 stages as test_tcp.sh.
+# Data plane: run the same SOCKS5 CONNECT stages as test_tcp.sh.
 run_socks5_new_conn TCP
 run_socks5_reuse_conn TCP
 

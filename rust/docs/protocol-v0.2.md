@@ -4,6 +4,8 @@
 
 > **破坏性重写（big-bang）**：V0.2 的线协议版本字节为 `4`。V0.1 的版本字节为 `3`。二者没有任何向后兼容，Go 实现与 Rust 实现之间**不需要互通**。升级必须两端同步；只升级一端时所有会话都会在握手阶段失败。
 
+> **外部传输为 UDP-only**：所有 `portBindings` 必须是 UDP，TCP 外部绑定在配置校验阶段即被拒绝（"TCP external transport has been removed; use protocol UDP"）。SOCKS5 CONNECT（TCP 目标）通过 UDP 隧道内的可靠层（`DatagramStream` / `StreamUnderlay`）承载。本规范中残留的 "TCP 密码链 / TCP 规则" 等措辞描述的是**隧道内可靠流的会话模式**，不是外部 TCP 传输；外部线路上只有 UDP 数据报。
+
 ---
 
 ## 1. 符号与常量
@@ -101,13 +103,36 @@ userHint  = SHA256(hintInput)[0:4]          // 4 字节，写入 wireNonce[20:24
 
 ### 2.5 前向安全
 
-握手静态密钥只保护两个握手包；数据面的全部密钥来自一次性 X25519 交换（`shared`）加上双方随机盐。会话结束后双方应尽力清零一次性私钥。即使用户名/密码或静态密钥事后泄露，攻击者若未持有该次握手的两包密文与一次性私钥，也无法还原历史会话密钥。
+握手后的数据面密钥来自一次性 X25519 交换（`shared`）加上双方随机盐，具备前向安全；会话结束后双方应尽力清零一次性私钥。即使用户名/密码或静态密钥事后泄露，攻击者若未持有该次握手的两包密文与一次性私钥，也无法还原握手后的会话密钥。
+
+但 **0-RTT early data 没有前向安全**：首包 piggyback 中的 SOCKS5 请求以及紧跟其后的应用字节，使用的是由静态密钥派生的 early key（见 §2.6）。静态密钥泄露即可还原这些早期数据。因此 early key 只在首 flight 使用，一旦 `openSessionResponse` 处理完成（客户端）/发送完成（服务端），立即切换到前向安全密钥，且首 flight 之后到达的应用字节会被缓存到密钥切换完成才提交。
+
+### 2.6 0-RTT 早期密钥（early key）
+
+两端在 X25519 交换完成之前，仅凭已认证的静态密钥、会话 ID 与信封套件即可各自推导出一对方向独立的 early key：
+
+```
+salt       = SHA256(staticKey ‖ u32be(sessionID))
+info_c2s   = "ShadowLemon V0.2 0rtt c2s" ‖ 0x04 ‖ byte(envelopeSuite)
+info_s2c   = "ShadowLemon V0.2 0rtt s2c" ‖ 0x04 ‖ byte(envelopeSuite)
+early_c2s  = HKDF-SHA256(ikm=staticKey, salt=salt, info=info_c2s, L=envelopeSuite.KeyLen())
+early_s2c  = HKDF-SHA256(ikm=staticKey, salt=salt, info=info_s2c, L=envelopeSuite.KeyLen())
+```
+
+- `sessionID` 绑定进 salt，因此不同会话的 early key 独立；但没有临时私钥输入，所以 early data 不具前向安全（见 §2.5）。
+- 数据面 `Session` 以 early key 创建，首 flight 的 SOCKS5 请求（piggyback）与紧随的应用字节即在 early key 下发送；服务端可在同一 flight 内解析并转发。
+- `openSessionResponse` 处理/发送完成后，调用 `Session::upgrade_keys` swap 为 §3.3 派生的前向安全 `c2sKey` / `s2cKey`。首 flight 之后到达的应用数据在 swap 完成前被 gate，保证每条数据帧只属于一个密钥 epoch。
+- early key 与 §3.3 的会话密钥在密码学上互不相关（不同的 HKDF info 前缀）。
 
 ---
 
-## 3. 握手（1-RTT）
+## 3. 握手（0-RTT）
 
-每个会话（每个 TCP 连接、每个 UDP 会话）在传输应用数据前都要完成一次握手。握手请求是 `openSessionRequest`（协议类型 2）载荷的**前缀**；握手响应是 `openSessionResponse`（协议类型 3）载荷的**全部内容**。
+V0.2 握手是 **0-RTT**：客户端发出的**第一个数据报**就同时携带握手请求与 SOCKS5 请求（piggyback），这些数据在 §2.6 的 early key 下加密。服务端在同一个 flight 内完成发现、套件协商、解析 piggyback 并转发到目标；无需等客户端再发一轮数据。外部传输只有 UDP，因此这里说的"会话"是 UDP 上的一条逻辑流（CONNECT 的可靠流，或 UDP associate 的数据报会话）。
+
+握手请求是 `openSessionRequest`（协议类型 2）载荷的**前缀**；握手响应是 `openSessionResponse`（协议类型 3）载荷的**全部内容**。所有 `HandshakeMode`（`HANDSHAKE_DEFAULT`、`HANDSHAKE_STANDARD`、`HANDSHAKE_NO_WAIT`）都使用这一 0-RTT 流程；其中 `HANDSHAKE_NO_WAIT` 明确表示客户端在返回流/数据报句柄前不等待响应，其余模式名保留仅为兼容旧配置。
+
+> 数据面 gate：CONNECT 流会立即返回给上层，但它的读写被 gate 直到前向安全 key swap 完成（`openSessionResponse` 处理完成）。因此 early data 虽在首 flight 即被服务端转发，首 flight 之后的应用字节仍会在客户端等待密钥切换。early data 无前向安全（§2.5）。
 
 ### 3.1 握手请求载荷前缀
 
@@ -120,7 +145,7 @@ userHint  = SHA256(hintInput)[0:4]          // 4 字节，写入 wireNonce[20:24
 | 3+`suiteCount` | `ephPubClient` | 32 | 一次性 X25519 公钥 |
 | 35+`suiteCount` | `clientSalt` | 16 | 客户端随机盐 |
 
-前缀总长 `51 + suiteCount` 字节（`suiteCount=1` 时为 52）。**应用数据可以紧跟在该前缀之后，放在同一载荷内**（其长度计入元数据的 `payload length`）。载荷用信封套件的静态密钥加密，与元数据相同密钥、不同 nonce（见 §4.2）。
+前缀总长 `51 + suiteCount` 字节（`suiteCount=1` 时为 52）。**应用数据可以紧跟在该前缀之后，放在同一载荷内**（其长度计入元数据的 `payload length`）。在 0-RTT 流程中，这段 piggyback 的开头是 SOCKS5 `CONNECT` 或 `UDP ASSOCIATE` 请求，后面可紧跟立即可用的应用字节（受 `piggyback_capacity` 限制）。载荷用信封套件的静态密钥加密，与元数据相同密钥、不同 nonce（见 §4.2）；数据面会话则以 §2.6 的 early key 启动并在握手完成后 swap 到前向安全密钥。
 
 ### 3.2 握手响应载荷
 
@@ -163,7 +188,7 @@ s2cKey    = HKDF-SHA256(ikm=shared, salt=salt, info=info_s2c, L=finalSuite.KeyLe
 
 ### 3.5 解析失败与零响应字节
 
-下列任一情形，服务端**不写任何响应字节**，直接关闭会话（TCP 关闭连接；UDP 丢弃该数据报并继续监听）：
+下列任一情形，服务端**不写任何响应字节**，直接丢弃该 UDP 数据报并继续监听（外部传输为 UDP-only，不存在 TCP 连接可关闭）：
 
 - 载荷截断，或不足 `51 + suiteCount` 字节；
 - `suiteCount` 不在 `1..4`；
@@ -196,10 +221,10 @@ s2cKey    = HKDF-SHA256(ikm=shared, salt=salt, info=info_s2c, L=finalSuite.KeyLe
 
 ### 4.2 同一数据段内元数据与载荷的 nonce 分离
 
-- **TCP**：每条密码链维护一个 24 字节计数器 `nonce`。元数据用当前 `nonce` 的派生 nonce 加密，随后 `nonce` 自增 1；若存在载荷，载荷用自增后 `nonce` 的派生 nonce 加密，随后 `nonce` 再自增 1。`inc()` 把 24 字节视作大端整数 `mod 2^192` 加一。每条消息执行 1 次（无载荷）或 2 次（有载荷）加密与自增。
+- **可靠流（隧道内）**：每条密码链维护一个 24 字节计数器 `nonce`。元数据用当前 `nonce` 的派生 nonce 加密，随后 `nonce` 自增 1；若存在载荷，载荷用自增后 `nonce` 的派生 nonce 加密，随后 `nonce` 再自增 1。`inc()` 把 24 字节视作大端整数 `mod 2^192` 加一。每条消息执行 1 次（无载荷）或 2 次（有载荷）加密与自增。
 - **UDP**：每个数据报自带 24 字节 `wireNonce`。载荷 nonce 为其副本，令 `payloadNonce[16] ^= 0x01`，再按 §2.3 截取 AEAD nonce。下标 16 不属于 `[0:12]`（可被 traffic pattern 重写）也不属于 `[20:24]`（用户提示），且异或非零值保证 `payloadNonce ≠ wireNonce`。
 
-### 4.3 TCP 规则
+### 4.3 可靠流（隧道内）规则
 
 - 每条密码链的**第一条消息**携带显式 24 字节 nonce；后续消息省略 nonce，接收端按 §4.2 隐式重建。
 - 握手完成时密钥链切换（静态密钥 → 会话密钥），**新密码链的第一条消息再次携带一个全新的 24 字节随机 nonce**，隐式计数器随之重置；一条连接最多切换一次链，切换后收到的第二个 `openSessionRequest` 直接丢弃。
@@ -458,9 +483,9 @@ sig = FNV1a64(m)
 
 每方向 2 代，每代容量 `65536` 条签名。满足任一条件即轮换：当前代写满 `65536` 条，或距创建超过 `360` 秒（6 分钟）。轮换时：丢弃最老一代 → 当前代降为上一代 → 清空并创建新当前代。查表同时检查当前代与上一代，因此一条记录从写入到彻底消失至少跨两次轮换。
 
-### 8.4 TCP 与 UDP 的差异
+### 8.4 可靠流与 UDP 数据报的差异
 
-- **TCP**：只对**每条密码链的第一条消息**做重放检查（后续消息用隐式递增 nonce，复制会因 nonce 不匹配在认证阶段失败）。检查携带**空来源标记**——因此任何重复投递都会被判为重放，连接以重放错误关闭。
+- **可靠流（隧道内，原 TCP 模式）**：只对**每条密码链的第一条消息**做重放检查（后续消息用隐式递增 nonce，复制会因 nonce 不匹配在认证阶段失败）。检查携带**空来源标记**——因此任何重复投递都会被判为重放，会话以重放错误关闭。
 - **UDP**：检查携带来源地址标记 `tag = addrFamily(1) ‖ ip(4 或 16) ‖ u16be(port)`，其中 `addrFamily = 4 或 6`。仅当「命中记录的标记与本次标记相同」且「标记非空」时豁免放行（同源重传）。来自其它地址的同一密文一律判为重放；**空标记永不豁免**。被判为重放的 UDP 数据报直接丢弃，端点继续处理后续报文，不下线。
 
 ---
@@ -476,7 +501,7 @@ sig = FNV1a64(m)
 | `data` | X | 原始 UDP associate 数据报 |
 | `marker 2` | 1 | `0xff` |
 
-封装结果作为应用数据交给 TCP/UDP 代理协议加密传输。
+封装结果作为应用数据交给 UDP 隧道（可靠流或数据报会话）加密传输；外部不再有 TCP 传输路径。
 
 ---
 
@@ -485,7 +510,7 @@ sig = FNV1a64(m)
 接收端处理一个数据段的推荐顺序，确保「先只读查表、后写入」不变量：
 
 1. 读取**定长部分**：携带 nonce 时先读 `24` 字节，再读 `32` 字节元数据密文与 `16` 字节标签（共 72 字节）；同一密码链的后续 TCP 消息只读后 48 字节（nonce 由隐式计数器重建）。
-2. 用报文的完整 24 字节 `wireNonce` 计算 `sig`，做只读重放查表；若命中且不豁免 → 丢弃（TCP 关闭连接 / UDP 丢弃数据报）。此步不解密、不改动缓存。
+2. 用报文的完整 24 字节 `wireNonce` 计算 `sig`，做只读重放查表；若命中且不豁免 → 丢弃该 UDP 数据报（外部传输为 UDP-only）。此步不解密、不改动缓存。
 3. 用相应密钥与派生 nonce 解密元数据；失败 → 丢弃。
 4. 解析元数据并做结构校验（类型合法、长度上限、保留字段忽略、低熵参数校验 §7.5）。
 5. **按元数据中的 `prefixLen` / `payloadLen` / `suffixLen` 读取剩余变长部分**（padding 1 / 载荷正文 / 载荷标签 / padding 2）；读取长度与字段不一致 → 丢弃。
@@ -532,3 +557,5 @@ sig = FNV1a64(m)
 | UDP 重传豁免 | 同源非空标记豁免，空标记不豁免 | 不变 |
 | UDP Associate 封装 | `0x00 ‖ u16be(len) ‖ data ‖ 0xff` | 不变 |
 | 配置字段 | 见 config-v0.2.md | JSON 字段名与结构保持不变（详见配置规范），时间相关概念在协议层消除 |
+| 外部传输 | TCP 或 UDP 端口绑定 | **仅 UDP**；TCP 绑定被校验拒绝，SOCKS5 CONNECT 改用 UDP 隧道可靠层 |
+| 握手往返 | `HANDSHAKE_NO_WAIT` 为 0-RTT，其余模式 1-RTT | 所有模式均为 0-RTT：首包 piggyback + 静态密钥派生 early key（§2.6）；数据面 I/O gated 到前向安全 key swap 完成，early data 无前向安全 |

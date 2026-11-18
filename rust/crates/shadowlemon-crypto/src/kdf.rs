@@ -16,6 +16,10 @@ pub const STATIC_KEY_SALT_INFO: &[u8] = b"ShadowLemon V0.2 static key salt";
 pub const C2S_INFO: &[u8] = b"ShadowLemon V0.2 c2s";
 /// HKDF info prefix of the server-to-client direction.
 pub const S2C_INFO: &[u8] = b"ShadowLemon V0.2 s2c";
+/// HKDF info prefix of 0-RTT client-to-server early data.
+pub const EARLY_C2S_INFO: &[u8] = b"ShadowLemon V0.2 0rtt c2s";
+/// HKDF info prefix of 0-RTT server-to-client early data.
+pub const EARLY_S2C_INFO: &[u8] = b"ShadowLemon V0.2 0rtt s2c";
 
 /// A key derived from the user credential and the envelope suite.
 ///
@@ -262,6 +266,71 @@ pub fn derive_session_keys_v4(
     )
 }
 
+/// Derive the two directional 0-RTT early keys from the static key alone.
+///
+/// Both peers can compute these from the handshake request, before any X25519
+/// exchange or server salt is available. The salt binds the session id so
+/// different sessions get independent keys, but there is no ephemeral input:
+/// early application data protected with these keys has **no forward secrecy**
+/// and must not outlive the handshake.
+///
+/// ```text
+/// salt = SHA256(static_key || u32be(session_id))
+/// info = "ShadowLemon V0.2 0rtt c2s" || [version] || [suite_byte]   (and " s2c")
+/// c2s  = HKDF-SHA256(static_key, salt, info, suite.key_len())
+/// ```
+pub fn derive_early_keys(
+    static_key: &[u8],
+    session_id: u32,
+    suite: Suite,
+) -> Result<(SessionKey, SessionKey), CryptoError> {
+    if !suite.is_valid() {
+        return Err(CryptoError::UnknownSuite(suite.as_u8()));
+    }
+    if static_key.is_empty() || static_key.len() > KEY_LEN {
+        return Err(CryptoError::InvalidKeyLength {
+            suite,
+            got: static_key.len(),
+            want: suite.key_len(),
+        });
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(static_key);
+    hasher.update(session_id.to_be_bytes());
+    let salt = hasher.finalize();
+
+    let key_len = suite.key_len();
+    let version = crate::DEFAULT_PROTOCOL_VERSION;
+    let c2s_bytes = hkdf_sha256(
+        static_key,
+        &salt,
+        &session_info(EARLY_C2S_INFO, version, suite),
+        key_len,
+    )?;
+    let s2c_bytes = hkdf_sha256(
+        static_key,
+        &salt,
+        &session_info(EARLY_S2C_INFO, version, suite),
+        key_len,
+    )?;
+
+    let mut c2s = [0u8; KEY_LEN];
+    let mut s2c = [0u8; KEY_LEN];
+    c2s[..key_len].copy_from_slice(&c2s_bytes);
+    s2c[..key_len].copy_from_slice(&s2c_bytes);
+    Ok((
+        SessionKey {
+            bytes: c2s,
+            len: key_len,
+        },
+        SessionKey {
+            bytes: s2c,
+            len: key_len,
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,5 +566,76 @@ mod tests {
         assert!(
             derive_session_keys_v4(&[1u8; 32], &salt, &salt, &[0u8; 31], Suite::Aes256Gcm).is_err()
         );
+    }
+
+    #[test]
+    fn early_keys_are_deterministic() {
+        let static_key = derive_static_key("alice", b"password", Suite::Aes256Gcm).unwrap();
+        let suite = Suite::XChaCha20Poly1305;
+
+        let (c2s, s2c) = derive_early_keys(static_key.as_slice(), 0x0102_0304, suite).unwrap();
+        let (c2s_again, s2c_again) =
+            derive_early_keys(static_key.as_slice(), 0x0102_0304, suite).unwrap();
+
+        assert_eq!(c2s.as_slice(), c2s_again.as_slice());
+        assert_eq!(s2c.as_slice(), s2c_again.as_slice());
+        assert_ne!(c2s.as_slice(), s2c.as_slice());
+        assert_eq!(c2s.len(), suite.key_len());
+        assert_eq!(s2c.len(), suite.key_len());
+    }
+
+    #[test]
+    fn early_keys_bind_the_session_id() {
+        let static_key = derive_static_key("alice", b"password", Suite::Aes256Gcm).unwrap();
+        let suite = Suite::Aes256Gcm;
+
+        let (c2s, s2c) = derive_early_keys(static_key.as_slice(), 1, suite).unwrap();
+        let (other_c2s, other_s2c) = derive_early_keys(static_key.as_slice(), 2, suite).unwrap();
+        assert_ne!(c2s.as_slice(), other_c2s.as_slice());
+        assert_ne!(s2c.as_slice(), other_s2c.as_slice());
+    }
+
+    #[test]
+    fn early_keys_differ_from_x25519_session_keys() {
+        let static_key = derive_static_key("alice", b"password", Suite::Aes256Gcm).unwrap();
+        let suite = Suite::XChaCha20Poly1305;
+        let session_id = 0x0102_0304;
+        let shared = [7u8; 32];
+        let client = [1u8; 16];
+        let server = [2u8; 16];
+
+        let (early_c2s, early_s2c) =
+            derive_early_keys(static_key.as_slice(), session_id, suite).unwrap();
+        let (session_c2s, session_s2c) =
+            derive_session_keys_v4(static_key.as_slice(), &client, &server, &shared, suite)
+                .unwrap();
+
+        assert_ne!(early_c2s.as_slice(), session_c2s.as_slice());
+        assert_ne!(early_s2c.as_slice(), session_s2c.as_slice());
+    }
+
+    #[test]
+    fn early_keys_reject_bad_inputs() {
+        let suite = Suite::Aes256Gcm;
+        assert_eq!(
+            derive_early_keys(&[], 1, suite).err().unwrap(),
+            CryptoError::InvalidKeyLength {
+                suite,
+                got: 0,
+                want: suite.key_len(),
+            }
+        );
+        assert_eq!(
+            derive_early_keys(&[1u8; KEY_LEN + 1], 1, suite)
+                .err()
+                .unwrap(),
+            CryptoError::InvalidKeyLength {
+                suite,
+                got: KEY_LEN + 1,
+                want: suite.key_len(),
+            }
+        );
+        let (c2s, _) = derive_early_keys(&[1u8; KEY_LEN], 1, Suite::Aes128Gcm).unwrap();
+        assert_eq!(c2s.len(), 16);
     }
 }

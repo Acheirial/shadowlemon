@@ -3,16 +3,15 @@
 //!
 //! # Client
 //!
-//! [`ClientMux`] owns a pool of TCP/UDP underlays to the configured server
+//! [`ClientMux`] owns a pool of UDP underlays to the configured server
 //! endpoints. It allocates non-zero session IDs, chooses endpoints round
-//! robin, applies the configured connection-reuse policy, optionally dials an
-//! upstream SOCKS5 proxy first, and delegates the actual 1-RTT V0.2 handshake
-//! to a [`ClientHandshake`]. It implements `shadowlemon_socks5::ProxyDialer`
-//! so a SOCKS5 ingress can use it directly.
+//! robin, applies the configured connection-reuse policy, and delegates the
+//! actual 1-RTT V0.2 handshake to a [`ClientHandshake`]. It implements
+//! `shadowlemon_socks5::ProxyDialer` so a SOCKS5 ingress can use it directly.
 //!
 //! # Server
 //!
-//! [`ServerMux`] listens on the configured TCP/UDP port bindings, applies a
+//! [`ServerMux`] listens on the configured UDP port bindings, applies a
 //! per-source-IP token bucket (burst 2048, refill 512/s), caps concurrent
 //! underlays at 4096, expires idle server underlays after three minutes, and
 //! runs a five-second cleaner. Every accepted `openSessionRequest` is passed
@@ -44,7 +43,6 @@ use futures::future::BoxFuture;
 use shadowlemon_crypto::{aead::AeadKey, suite::Suite};
 use shadowlemon_socks5::{AsyncIo, DatagramSocket, ProxyDialer, TokioDatagramSocket};
 use tokio::{
-    net::{TcpListener, TcpStream},
     sync::{Mutex, Notify},
     task::JoinHandle,
     time,
@@ -76,8 +74,6 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Transport of a configured port binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportKind {
-    /// Reliable byte stream.
-    Tcp,
     /// Datagrams.
     Udp,
 }
@@ -85,7 +81,7 @@ pub enum TransportKind {
 /// One port binding of an endpoint or listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PortBindingSpec {
-    /// UDP/TCP port number.
+    /// UDP port number.
     pub port: u16,
     /// Transport protocol.
     pub protocol: TransportKind,
@@ -172,11 +168,10 @@ impl Endpoint {
     /// First resolved address for a given transport.
     pub async fn address_for(&self, protocol: TransportKind) -> UnderlayResult<SocketAddr> {
         let mut addrs = self.resolve().await?;
-        addrs.retain(|addr| match protocol {
-            TransportKind::Tcp | TransportKind::Udp => self
-                .port_bindings
+        addrs.retain(|addr| {
+            self.port_bindings
                 .iter()
-                .any(|b| b.protocol == protocol && b.port == addr.port()),
+                .any(|b| b.protocol == protocol && b.port == addr.port())
         });
         addrs.into_iter().next().ok_or_else(|| {
             UnderlayError::InvalidEndpoint(format!("no {protocol:?} binding in endpoint"))
@@ -316,20 +311,26 @@ impl MuxConfig {
 /// Minimal client-side handshake interface needed by [`ClientMux`].
 ///
 /// The integrator should forward these calls to the V0.2 handshake module:
-/// perform a 1-RTT `openSessionRequest`/`openSessionResponse` exchange over
-/// `stream` (or a UDP underlay), derive the session keys, install them with
+/// perform a 1-RTT `openSessionRequest`/`openSessionResponse` exchange over a
+/// UDP underlay, derive the session keys, install them with
 /// `Underlay::install_session_cipher`, and return an I/O object that carries
-/// only this session's application bytes. `session_id` is allocated by the
-/// mux and must be carried in the request metadata.
+/// only this session's application bytes. `session_id` is allocated by the mux
+/// and must be carried in the request metadata. Both methods are backed by UDP;
+/// `open_tcp` wraps the session in a byte stream for SOCKS5 CONNECT.
 pub trait ClientHandshake: Send + Sync + std::fmt::Debug {
-    /// Establish a stream session to `endpoint` for `target`.
+    /// Establish a byte-stream session to `endpoint` for `target` over UDP.
+    ///
+    /// `session_id` is allocated by the mux and must be used in the handshake
+    /// request metadata so that mux bookkeeping matches the live session.
+    /// `reuse` tells the driver whether the mux's reuse policy selected an
+    /// existing packet underlay instead of a fresh one.
     fn open_tcp<'a>(
         &'a self,
-        stream: Box<dyn AsyncIo>,
         session_id: u32,
         endpoint: &'a Endpoint,
         target: SocketAddr,
         host: Option<&'a str>,
+        reuse: bool,
     ) -> BoxFuture<'a, io::Result<Box<dyn AsyncIo>>>;
 
     /// Establish a datagram session to `endpoint` for `target`.
@@ -353,40 +354,40 @@ pub trait ClientHandshake: Send + Sync + std::fmt::Debug {
 
 /// Minimal server-side handshake interface needed by [`ServerMux`].
 ///
-/// The integrator should forward `accept_tcp` to the server handshake/session
-/// logic, and `accept_udp` to the UDP `openSessionRequest` dispatcher. The
-/// returned bytes (if any) are sent back to `source` unchanged.
+/// The integrator should forward `accept_udp` to the UDP `openSessionRequest`
+/// dispatcher. Every returned payload is sent back to `source` unchanged, in
+/// order, within the same inbound-datagram turn; an empty vector sends nothing.
 pub trait ServerHandshake: Send + Sync + std::fmt::Debug {
-    /// Run one accepted TCP connection to completion.
-    fn accept_tcp<'a>(
-        &'a self,
-        stream: Box<dyn AsyncIo>,
-        source: SocketAddr,
-    ) -> BoxFuture<'a, io::Result<()>>;
-
-    /// Process one UDP datagram, optionally returning a reply payload.
+    /// Process one UDP datagram, returning zero or more reply payloads.
     fn accept_udp<'a>(
         &'a self,
         datagram: Vec<u8>,
         source: SocketAddr,
-    ) -> BoxFuture<'a, io::Result<Option<Vec<u8>>>>;
+    ) -> BoxFuture<'a, io::Result<Vec<Vec<u8>>>>;
 }
 
 /// Test adapter that skips the cryptographic handshake and returns the
-/// underlying stream/socket unchanged. **Not for production use.**
+/// underlying socket unchanged. **Not for production use.**
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PassthroughClientHandshake;
 
 impl ClientHandshake for PassthroughClientHandshake {
     fn open_tcp<'a>(
         &'a self,
-        stream: Box<dyn AsyncIo>,
         _session_id: u32,
         _endpoint: &'a Endpoint,
         _target: SocketAddr,
         _host: Option<&'a str>,
+        _reuse: bool,
     ) -> BoxFuture<'a, io::Result<Box<dyn AsyncIo>>> {
-        Box::pin(async move { Ok(stream) })
+        // Tests using this adapter only exercise mux bookkeeping, not the
+        // byte-stream path; the real driver provides the UDP-backed stream.
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "PassthroughClientHandshake::open_tcp is not implemented",
+            ))
+        })
     }
 
     fn open_udp<'a>(
@@ -417,20 +418,12 @@ impl ClientHandshake for PassthroughClientHandshake {
 pub struct NoopServerHandshake;
 
 impl ServerHandshake for NoopServerHandshake {
-    fn accept_tcp<'a>(
-        &'a self,
-        _stream: Box<dyn AsyncIo>,
-        _source: SocketAddr,
-    ) -> BoxFuture<'a, io::Result<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
     fn accept_udp<'a>(
         &'a self,
         _datagram: Vec<u8>,
         _source: SocketAddr,
-    ) -> BoxFuture<'a, io::Result<Option<Vec<u8>>>> {
-        Box::pin(async { Ok(None) })
+    ) -> BoxFuture<'a, io::Result<Vec<Vec<u8>>>> {
+        Box::pin(async { Ok(vec![]) })
     }
 }
 
@@ -537,11 +530,11 @@ impl ClientMux {
 
     /// Allocate a non-zero, unpredictable session ID.
     ///
-    /// Sequential IDs are a stable traffic fingerprint: on the UDP path the
-    /// session ID is visible in the routing envelope, and even on TCP it is
-    /// carried in encrypted metadata that an observer can correlate across
-    /// packet lengths and timing. Draw a random 32-bit value instead, retrying
-    /// on the reserved value 0 and on a rare collision with a live session.
+    /// Sequential IDs are a stable traffic fingerprint: the session ID is
+    /// visible in the UDP routing envelope, where an observer can correlate it
+    /// across packet lengths and timing. Draw a random 32-bit value instead,
+    /// retrying on the reserved value 0 and on a rare collision with a live
+    /// session.
     pub fn allocate_session_id(&self) -> UnderlayResult<u32> {
         for _ in 0..8 {
             let id = rand::random::<u32>();
@@ -636,7 +629,9 @@ impl ClientMux {
         self.inner.active.store(0, Ordering::Release);
     }
 
-    /// Dial a stream session through the tunnel (SOCKS5 CONNECT equivalent).
+    /// Dial a byte-stream session through the UDP tunnel (SOCKS5 CONNECT
+    /// equivalent). The handshake adapter owns the UDP socket and returns a
+    /// byte stream carrying only this session's application data.
     pub fn open_tcp<'a>(
         &'a self,
         target: SocketAddr,
@@ -648,63 +643,31 @@ impl ClientMux {
             }
             let endpoint = self.next_endpoint();
             let server_addr = endpoint
-                .address_for(TransportKind::Tcp)
+                .address_for(TransportKind::Udp)
                 .await
                 .map_err(io_error)?;
             let session_id = self.allocate_session_id().map_err(io_error)?;
             self.try_reserve_underlay().map_err(io_error)?;
-
-            let upstream = self.inner.upstream.lock().await.clone();
-            let mut last_error = None;
-            let mut stream = None;
-            for attempt in 0..self.inner.config.reconnect_attempts.max(1) {
-                match &upstream {
-                    Some(dialer) => match dialer.dial_tcp(server_addr, None).await {
-                        Ok(io) => {
-                            stream = Some(io);
-                            break;
-                        }
-                        Err(error) => last_error = Some(error),
-                    },
-                    None => match TcpStream::connect(server_addr).await {
-                        Ok(socket) => {
-                            stream = Some(Box::new(socket) as Box<dyn AsyncIo>);
-                            break;
-                        }
-                        Err(error) => last_error = Some(error),
-                    },
-                }
-                if attempt + 1 < self.inner.config.reconnect_attempts.max(1) {
-                    time::sleep(Duration::from_millis(50) * (attempt + 1)).await;
-                }
-            }
-            let stream = match stream {
-                Some(stream) => stream,
-                None => {
-                    self.release_underlay();
-                    return Err(last_error.unwrap_or_else(|| {
-                        io::Error::new(io::ErrorKind::TimedOut, "no connection attempts")
-                    }));
-                }
-            };
+            let reuse = self.should_reuse_packet();
+            debug!(session_id, reuse, %server_addr, "opening stream-over-UDP session");
 
             let handshake = time::timeout(
                 self.inner.config.handshake_timeout,
                 self.inner
                     .handshake
-                    .open_tcp(stream, session_id, endpoint, target, host),
+                    .open_tcp(session_id, endpoint, target, host, reuse),
             )
             .await;
             match handshake {
-                Ok(Ok(session)) => {
+                Ok(Ok(stream)) => {
                     self.inner.sessions.insert(
                         session_id,
                         SessionInfo {
-                            kind: UnderlayKind::Stream,
+                            kind: UnderlayKind::Packet,
                             opened_at: Instant::now(),
                         },
                     );
-                    Ok(session)
+                    Ok(stream)
                 }
                 Ok(Err(error)) => {
                     self.release_underlay();
@@ -944,20 +907,10 @@ impl ServerMux {
         let mut tasks = self.inner.tasks.lock().await;
         tasks.push(tokio::spawn(cleanup_task(Arc::clone(&self.inner))));
         for binding in &self.inner.bindings {
-            match binding.protocol {
-                TransportKind::Tcp => {
-                    tasks.push(tokio::spawn(tcp_listener_task(
-                        Arc::clone(&self.inner),
-                        binding.port,
-                    )));
-                }
-                TransportKind::Udp => {
-                    tasks.push(tokio::spawn(udp_listener_task(
-                        Arc::clone(&self.inner),
-                        binding.port,
-                    )));
-                }
-            }
+            tasks.push(tokio::spawn(udp_listener_task(
+                Arc::clone(&self.inner),
+                binding.port,
+            )));
         }
         Ok(())
     }
@@ -1038,54 +991,6 @@ impl ServerMuxInner {
     }
 }
 
-async fn tcp_listener_task(inner: Arc<ServerMuxInner>, port: u16) {
-    let addr = SocketAddr::new(inner.listen_ip, port);
-    let listener = match TcpListener::bind(addr).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            warn!(%addr, %error, "failed to bind TCP underlay listener");
-            return;
-        }
-    };
-    let mut attempt = 0u32;
-    loop {
-        if inner.stopped.load(Ordering::Acquire) {
-            break;
-        }
-        match listener.accept().await {
-            Ok((stream, source)) => {
-                attempt = 0;
-                if !inner.allow_source(source.ip()) {
-                    debug!(%source, "source rate limit exceeded");
-                    continue;
-                }
-                let id = match inner.register_underlay(UnderlayKind::Stream) {
-                    Ok(id) => id,
-                    Err(error) => {
-                        warn!(%source, %error, "underlay limit reached");
-                        continue;
-                    }
-                };
-                let handshake = Arc::clone(&inner.handshake);
-                let task_inner = Arc::clone(&inner);
-                tokio::spawn(async move {
-                    let _ = handshake.accept_tcp(Box::new(stream), source).await;
-                    task_inner.underlays.remove(&id);
-                });
-            }
-            Err(error) => {
-                warn!(%addr, %error, "TCP accept failed; rebuilding listener");
-                attempt += 1;
-                let delay = inner.config.rebuild_delay(attempt);
-                tokio::select! {
-                    _ = time::sleep(delay) => {}
-                    _ = inner.notify.notified() => break,
-                }
-            }
-        }
-    }
-}
-
 async fn udp_listener_task(inner: Arc<ServerMuxInner>, port: u16) {
     let addr = SocketAddr::new(inner.listen_ip, port);
     let mut underlay = match crate::underlay_packet::PacketUnderlay::bind(
@@ -1126,12 +1031,13 @@ async fn udp_listener_task(inner: Arc<ServerMuxInner>, port: u16) {
                 let response = time::timeout(timeout, handshake.accept_udp(datagram, source)).await;
                 inner.underlays.remove(&id);
                 match response {
-                    Ok(Ok(Some(reply))) => {
-                        if let Err(error) = underlay.send_to(&reply, source).await {
-                            warn!(%source, %error, "failed to send UDP reply");
+                    Ok(Ok(replies)) => {
+                        for reply in replies {
+                            if let Err(error) = underlay.send_to(&reply, source).await {
+                                warn!(%source, %error, "failed to send UDP reply");
+                            }
                         }
                     }
-                    Ok(Ok(None)) => {}
                     Ok(Err(error)) => debug!(%source, %error, "UDP handshake failed"),
                     Err(_) => debug!(%source, "UDP handshake timed out"),
                 }
@@ -1180,10 +1086,7 @@ mod tests {
     fn endpoint() -> Vec<Endpoint> {
         vec![Endpoint::new(
             "127.0.0.1",
-            vec![
-                PortBindingSpec::new(2012, TransportKind::Tcp),
-                PortBindingSpec::new(2012, TransportKind::Udp),
-            ],
+            vec![PortBindingSpec::new(2012, TransportKind::Udp)],
         )]
     }
 
@@ -1195,15 +1098,10 @@ mod tests {
             Box::new(PassthroughClientHandshake),
         )
         .unwrap();
-        let tcp = mux.endpoints()[0]
-            .address_for(TransportKind::Tcp)
-            .await
-            .unwrap();
         let udp = mux.endpoints()[0]
             .address_for(TransportKind::Udp)
             .await
             .unwrap();
-        assert_eq!(tcp.port(), 2012);
         assert_eq!(udp.port(), 2012);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..10 {
@@ -1284,7 +1182,7 @@ mod tests {
         let mux = ServerMux::new(
             config,
             "127.0.0.1".parse().unwrap(),
-            vec![PortBindingSpec::new(0, TransportKind::Tcp)],
+            vec![PortBindingSpec::new(0, TransportKind::Udp)],
             Arc::new(NoopServerHandshake),
         )
         .unwrap();

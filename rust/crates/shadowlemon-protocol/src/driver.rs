@@ -3,19 +3,39 @@
 //! This module is the integration point the hand-written mux in [`crate::mux`]
 //! was designed for: it replaces the `PassthroughClientHandshake` /
 //! `NoopServerHandshake` test adapters with implementations that actually run
-//! the 1-RTT handshake and encrypt every application byte.
+//! the V0.2 handshake and encrypt every application byte.
 //!
-//! # TCP target convention
+//! # UDP-only external transport
+//!
+//! The external transport is UDP-only. SOCKS5 `CONNECT` is still offered to
+//! local clients, but the byte stream it needs is provided by the tunnel's
+//! reliable datagram session (see [`crate::stream::DatagramStream`]); there is
+//! no TCP transport handshake in this module.
 //!
 //! `mux::ClientHandshake::open_tcp` receives a resolved `target` plus an
 //! optional original hostname. The driver encodes that pair as a SOCKS5
-//! `CONNECT` request (`proto::encode_request(CMD_CONNECT, address, port)`) and
-//! places the resulting bytes in the `openSessionRequest` **piggyback** area,
-//! which the V0.2 handshake carries inside its authenticated envelope and the
-//! server handshake returns as `piggyback`. The server parses it with
-//! `proto::read_request`; a domain name is resolved with `lookup_host` before
-//! dialing. Bytes that followed the SOCKS5 request in the piggyback (no-wait
-//! style handshakes) are written to the target before the relay starts.
+//! `CONNECT` request (`encode_request(CMD_CONNECT, address, port)`) and places
+//! the resulting bytes in the `openSessionRequest` **piggyback** area, which
+//! the handshake carries inside its authenticated envelope. The server parses
+//! it with `read_request`, resolves a domain name with `lookup_host`, dials the
+//! TCP target and relays the resulting byte stream through the datagram
+//! session. Bytes that followed the SOCKS5 request in the piggyback are
+//! written to the target before the relay starts.
+//!
+//! # 0-RTT early keys
+//!
+//! Both peers derive an early c2s/s2c key pair from the authenticated static
+//! key, the session id and the envelope suite before any X25519 exchange
+//! completes. The request piggyback (the SOCKS5 request plus any immediately
+//! available application bytes that fit the handshake's capacity) is therefore
+//! protected by the static-key envelope and can be acted on by the server in
+//! the same flight that carries the handshake response. Early data has **no
+//! forward secrecy**: only the post-handshake data keys do. The driver starts
+//! each data-plane [`Session`](crate::session::Session) with the early keys and
+//! swaps in the forward-secret keys once `openSessionResponse` has been
+//! processed (client) or sent (server). Application bytes that arrive after the
+//! first flight are held until the swap completes, so every data-plane frame
+//! is encrypted with exactly one unambiguous key epoch.
 //!
 //! # UDP conventions
 //!
@@ -24,40 +44,30 @@
 //! everything after the envelope header is a genuine V0.2 frame.
 //!
 //! 1. Routing envelope: `[kind: u8][session_id: u32be][wire frame ..]`, where
-//!    `kind` is 1 = handshake request, 2 = session data, 3 = handshake
-//!    response, 4 = session reply. The mux passes the whole datagram to
+//!    `kind` is 1 = handshake request, 2 = handshake response, 3 = session
+//!    data, 4 = session reply. The mux passes the whole datagram to
 //!    `ServerHandshake::accept_udp` and sends its returned bytes back
 //!    unchanged; the client undoes the envelope on receive. The session ID is
 //!    therefore available for lookup **before** any AEAD key is known.
-//! 2. Target convention: the handshake piggyback carries a SOCKS5
-//!    `UDP ASSOCIATE` request for the destination. The first (and every)
+//! 2. Target convention: the handshake piggyback carries a SOCKS5 `CONNECT`
+//!    (stream) or `UDP ASSOCIATE` (datagram) request for the destination. Every
 //!    application datagram additionally carries a standard SOCKS5 UDP header
 //!    (`0x00 0x00 0x00 ATYP DST.ADDR DST.PORT`) followed by the real payload,
 //!    per `protocol-v0.2.md` §9. The server parses it with
-//!    `proto::parse_udp_datagram` and uses the address/port found there for
-//!    that datagram, so a single association can talk to several peers.
+//!    `parse_udp_datagram` and uses the address/port found there for that
+//!    datagram, so a single association can talk to several peers.
 //! 3. Application fragmentation: SOCKS5 datagrams are split to the MTU-derived
 //!    capacity and each piece is prefixed with
 //!    `[message_id: u32be][fragment_number: u8][fragment_count: u8]` before
 //!    being handed to the V0.2 `Session`. Fragment numbers count down to zero,
 //!    matching the wire metadata. Reassembly happens on both peers.
-//!
-//! # Key installation
-//!
-//! A V0.2 [`Session`](crate::session::Session) owns two independent directional
-//! AEAD keys and its own framing state, so the established c2s/s2c keys are
-//! installed into a `Session` and driven by [`TcpSessionStream`]. On the stream
-//! path a [`StreamUnderlay`] is also configured and its cipher chain installed
-//! (it is the framing primitive used by raw-underlay deployments); the raw I/O
-//! object is then handed to `TcpSessionStream`, which owns the data-plane
-//! framing so the two layers never double-encrypt.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -65,21 +75,16 @@ use std::{
 
 use dashmap::DashMap;
 use futures::future::BoxFuture;
-use shadowlemon_crypto::{
-    aead::AeadKey, kdf::derive_static_key, suite::Suite, HANDSHAKE_RESPONSE_LEN,
-};
+use shadowlemon_crypto::suite::Suite;
 use shadowlemon_socks5::{
     encode_request, encode_udp_header, parse_udp_datagram, read_request, Address, AsyncIo,
     Credential, DatagramSocket, EgressAction, EgressConfig, ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6,
     CMD_CONNECT, CMD_UDP_ASSOCIATE, MAX_UDP_DATAGRAM, VERSION,
 };
-use shadowlemon_wire::{
-    payload_block_len, Metadata, META_BLOCK_LEN, NONCE_AND_META_LEN, TAG_LEN, WIRE_NONCE_LEN,
-};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
-    sync::{mpsc, Mutex},
+    sync::{mpsc, oneshot, Mutex, Notify},
     time,
 };
 use tracing::{debug, warn};
@@ -87,15 +92,14 @@ use tracing::{debug, warn};
 use crate::{
     handshake::{
         build_registry, AeadUserDecryptor, ClientHandshake, ClientOutcome, HandshakeTransport,
-        ServerHandshake, ServerHandshakeResult, TYPE_OPEN_SESSION_REQUEST,
+        ServerHandshake, ServerHandshakeResult,
     },
     mux::{self, Endpoint, TransportKind},
     serveruser::{Registry, SourceKey, User},
     session::{Direction, Session, SessionConfig, TransportMode},
-    stream::TcpSessionStream,
-    underlay::{IpFamily, MtuBudget, Underlay, MAX_PREFIX_PADDING, MAX_SUFFIX_PADDING},
+    stream::DatagramStream,
+    underlay::{IpFamily, MtuBudget, MAX_PREFIX_PADDING, MAX_SUFFIX_PADDING},
     underlay_packet::PacketConfig,
-    underlay_stream::{StreamConfig, StreamUnderlay},
 };
 
 /// Routing envelope: handshake request (client → mux server).
@@ -112,8 +116,6 @@ const UDP_KIND_SESSION_REPLY: u8 = 4;
 const UDP_ENVELOPE_LEN: usize = 5;
 /// `[message id][fragment number][fragment count]` application prefix.
 const APP_FRAGMENT_HEADER_LEN: usize = 6;
-/// Stream handshake response frame: encrypted metadata + fixed payload + tag.
-const STREAM_HANDSHAKE_RESPONSE_LEN: usize = META_BLOCK_LEN + HANDSHAKE_RESPONSE_LEN + TAG_LEN;
 /// How long a UDP relay waits for the first reply to a datagram.
 const DEFAULT_UDP_REPLY_WAIT: Duration = Duration::from_millis(100);
 /// Idle lifetime of a server-side UDP session.
@@ -130,6 +132,10 @@ const AUTH_SUCCESS: u8 = 0;
 /// Partial application fragments, keyed by message id, with the highest
 /// fragment number seen so far (numbers count down to zero).
 type FragmentMap = HashMap<u32, (BTreeMap<u8, Vec<u8>>, u8)>;
+/// Read half of a CONNECT-over-UDP target, owned by the reply relay task.
+type TcpReadHalf = Box<dyn AsyncRead + Unpin + Send>;
+/// Write half of a CONNECT-over-UDP target, owned by the session.
+type TcpWriteHalf = Box<dyn AsyncWrite + Unpin + Send>;
 
 fn io_err<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
@@ -160,8 +166,6 @@ pub struct RealClientConfig {
     pub credential: ClientCredential,
     /// Wire cipher suites in client preference order (never empty).
     pub suites: Vec<Suite>,
-    /// Traffic pattern applied to TCP nonces.
-    pub stream: StreamConfig,
     /// MTU and traffic pattern applied to UDP datagrams.
     pub packet: PacketConfig,
     /// Timeout for the handshake response.
@@ -199,15 +203,6 @@ impl RealClientConfig {
         }
         Ok(())
     }
-
-    fn credential_bytes(&self) -> [u8; 32] {
-        match &self.credential {
-            ClientCredential::Password(password) => {
-                shadowlemon_crypto::kdf::hash_password(password.as_bytes(), &self.username)
-            }
-            ClientCredential::Credential(bytes) => *bytes,
-        }
-    }
 }
 
 /// Configuration of [`RealServerHandshake`].
@@ -221,8 +216,6 @@ pub struct RealServerConfig {
     pub allowed_suites: Vec<Suite>,
     /// Egress policy applied when relaying to the target.
     pub egress: EgressConfig,
-    /// Traffic pattern applied to TCP nonces.
-    pub stream: StreamConfig,
     /// MTU and traffic pattern applied to UDP datagrams.
     pub packet: PacketConfig,
     /// Time a UDP relay waits for a reply before returning to the mux.
@@ -238,7 +231,6 @@ impl Default for RealServerConfig {
             hint_mandatory: true,
             allowed_suites: Vec::new(),
             egress: EgressConfig::new(),
-            stream: StreamConfig::default(),
             packet: PacketConfig::default(),
             udp_reply_wait: DEFAULT_UDP_REPLY_WAIT,
             udp_session_ttl: DEFAULT_UDP_SESSION_TTL,
@@ -309,6 +301,7 @@ impl RealClientHandshake {
     }
 
     async fn finish_udp_close(handle: Arc<UdpSessionHandle>) {
+        handle.shutdown.notify_waiters();
         let mut frames = {
             let mut session = handle.session.lock().await;
             let _ = session.close(true);
@@ -324,63 +317,118 @@ impl RealClientHandshake {
 impl mux::ClientHandshake for RealClientHandshake {
     fn open_tcp<'a>(
         &'a self,
-        mut stream: Box<dyn AsyncIo>,
         session_id: u32,
-        _endpoint: &'a Endpoint,
+        endpoint: &'a Endpoint,
         target: SocketAddr,
         host: Option<&'a str>,
+        _reuse: bool,
     ) -> BoxFuture<'a, io::Result<Box<dyn AsyncIo>>> {
         Box::pin(async move {
+            let server = endpoint
+                .address_for(TransportKind::Udp)
+                .await
+                .map_err(io_err)?;
+            let bind: SocketAddr = if server.is_ipv4() {
+                "0.0.0.0:0".parse().expect("literal address")
+            } else {
+                "[::]:0".parse().expect("literal address")
+            };
+            let socket = Arc::new(UdpSocket::bind(bind).await?);
             let address = match host {
                 Some(name) if !name.is_empty() => Address::Domain(name.to_owned()),
                 _ => Address::Ip(target.ip()),
             };
+            // The SOCKS5 CONNECT request is the 0-RTT early data: it travels in
+            // the authenticated handshake piggyback and the server forwards it
+            // in the same flight that carries the response. `build_request`
+            // enforces the piggyback capacity; there is no other application
+            // data available at this layer yet.
             let piggyback = encode_request(CMD_CONNECT, &address, target.port());
 
             let mut handshake =
-                self.build_client_handshake(session_id, HandshakeTransport::Stream)?;
+                self.build_client_handshake(session_id, HandshakeTransport::Datagram)?;
+            let (early_c2s, early_s2c) = handshake.early_keys().map_err(io_err)?;
             let request = handshake.build_request(&piggyback).map_err(io_err)?;
-            stream.write_all(&request).await?;
-            stream.flush().await?;
+            socket
+                .send_to(
+                    &wrap_udp(UDP_KIND_HANDSHAKE_REQUEST, session_id, &request),
+                    server,
+                )
+                .await?;
 
-            let mut response = vec![0u8; STREAM_HANDSHAKE_RESPONSE_LEN];
-            stream.read_exact(&mut response).await?;
-            let established = match handshake.process_response(&response).map_err(io_err)? {
-                ClientOutcome::Established(established) => *established,
-                ClientOutcome::NoCommonSuite => {
-                    warn!("no common cipher suite with the server");
-                    return Err(invalid_data("server rejected every offered cipher suite"));
-                }
-            };
-
-            // Install the envelope chain in the stream underlay (the framing
-            // primitive used by raw-underlay deployments), then hand the raw
-            // I/O to the session stream, which owns data-plane framing.
-            let static_key = derive_static_key(
-                &self.config.username,
-                &self.config.credential_bytes(),
-                self.config.suites[0],
+            // The data plane starts on the early keys so the first flight is
+            // protected without waiting for a round trip. A background task
+            // swaps in the forward-secret keys once the response is processed.
+            let session = Arc::new(Mutex::new(
+                Session::new(SessionConfig::new(
+                    session_id,
+                    Direction::Client,
+                    TransportMode::Datagram,
+                    early_c2s,
+                    early_s2c,
+                ))
+                .map_err(io_err)?,
+            ));
+            let max_fragment = MtuBudget::new(
+                self.config.packet.mtu,
+                IpFamily::from_addr(server.ip()),
+                true,
             )
-            .map_err(io_err)?;
-            let envelope_key =
-                AeadKey::new(self.config.suites[0], static_key.as_slice()).map_err(io_err)?;
-            let mut underlay =
-                StreamUnderlay::new(stream, envelope_key, self.config.stream.clone());
-            let session_cipher =
-                AeadKey::new(established.suite, established.c2s_key.key_bytes()).map_err(io_err)?;
-            underlay.install_session_cipher(session_cipher);
-            let transport = underlay.into_inner();
-
-            let session = Session::new(SessionConfig::new(
+            .map_err(io_err)?
+            .payload_capacity(MAX_PREFIX_PADDING, MAX_SUFFIX_PADDING)
+            .saturating_sub(APP_FRAGMENT_HEADER_LEN);
+            let handle = Arc::new(UdpSessionHandle {
                 session_id,
-                Direction::Client,
-                TransportMode::Stream,
-                established.c2s_key,
-                established.s2c_key,
-            ))
-            .map_err(io_err)?;
-            let tunnel: Box<dyn AsyncIo> = Box::new(TcpSessionStream::new(session, transport));
-            debug!(session_id, suite = %established.suite, "TCP session established to StreamUnderlay{{");
+                socket: Arc::clone(&socket),
+                session: Arc::clone(&session),
+                server,
+                shutdown: Arc::new(Notify::new()),
+            });
+            self.udp_sessions.insert(session_id, Arc::clone(&handle));
+
+            // A single reader demultiplexes the handshake response and the
+            // session's encrypted replies, which share the same UDP socket.
+            let inbound = Arc::new(UdpInbound::new(Arc::clone(&handle.shutdown)));
+            let (response_tx, response_rx) = oneshot::channel();
+            spawn_udp_reader(
+                Arc::clone(&socket),
+                server,
+                session_id,
+                response_tx,
+                Arc::clone(&inbound),
+                Arc::clone(&handle.shutdown),
+            );
+            let key_state = Arc::new(KeyUpgradeState::new());
+            spawn_stream_key_upgrade(
+                handshake,
+                response_rx,
+                Arc::clone(&session),
+                Arc::clone(&key_state),
+                handle,
+                self.config.handshake_timeout,
+            );
+
+            // Return the byte stream immediately; data-plane I/O is gated on
+            // the key swap so each frame uses exactly one unambiguous epoch.
+            let tunnel: Box<dyn AsyncIo> = Box::new(DatagramStream::new(
+                Box::new(TunnelDatagramSocket {
+                    socket,
+                    server,
+                    session_id,
+                    session,
+                    target,
+                    host: host.filter(|name| !name.is_empty()).map(str::to_owned),
+                    max_fragment,
+                    message_id: AtomicU32::new(1),
+                    recv_lock: Mutex::new(()),
+                    pending: Mutex::new(VecDeque::new()),
+                    assembler: Mutex::new(HashMap::new()),
+                    inbound: Some(inbound),
+                    key_state: Some(key_state),
+                }),
+                target,
+            ));
+            debug!(session_id, "UDP stream session opened to StreamUnderlay{{");
             Ok(tunnel)
         })
     }
@@ -468,6 +516,7 @@ impl mux::ClientHandshake for RealClientHandshake {
                 socket: Arc::clone(&socket),
                 session: Arc::clone(&session),
                 server,
+                shutdown: Arc::new(Notify::new()),
             });
             self.udp_sessions.insert(session_id, handle);
             debug!(session_id, suite = %established.suite, "UDP session established to PacketUnderlay{{");
@@ -483,6 +532,8 @@ impl mux::ClientHandshake for RealClientHandshake {
                 recv_lock: Mutex::new(()),
                 pending: Mutex::new(VecDeque::new()),
                 assembler: Mutex::new(HashMap::new()),
+                inbound: None,
+                key_state: None,
             });
             Ok(tunnel)
         })
@@ -565,34 +616,6 @@ impl RealServerHandshake {
         .map_err(io_err)
     }
 
-    async fn relay_tcp(
-        &self,
-        mut tunnel: TcpSessionStream<Box<dyn AsyncIo>>,
-        mut outbound: Box<dyn AsyncIo>,
-        initial: &[u8],
-    ) -> io::Result<()> {
-        if !initial.is_empty() {
-            outbound.write_all(initial).await?;
-            outbound.flush().await?;
-        }
-        let (mut tunnel_read, mut tunnel_write) = tokio::io::split(&mut tunnel);
-        let (mut outbound_read, mut outbound_write) = tokio::io::split(&mut *outbound);
-        let up = async {
-            let result = tokio::io::copy(&mut tunnel_read, &mut outbound_write).await;
-            let _ = outbound_write.shutdown().await;
-            result
-        };
-        let down = async {
-            let result = tokio::io::copy(&mut outbound_read, &mut tunnel_write).await;
-            let _ = tunnel_write.shutdown().await;
-            result
-        };
-        let (up, down) = tokio::join!(up, down);
-        up?;
-        down?;
-        Ok(())
-    }
-
     async fn dial_target(
         &self,
         address: &Address,
@@ -641,90 +664,11 @@ impl RealServerHandshake {
 }
 
 impl mux::ServerHandshake for RealServerHandshake {
-    fn accept_tcp<'a>(
-        &'a self,
-        mut stream: Box<dyn AsyncIo>,
-        source: SocketAddr,
-    ) -> BoxFuture<'a, io::Result<()>> {
-        Box::pin(async move {
-            let source_key = source_key(source);
-            // Read the fixed part first to learn the authenticated frame length
-            // from the encrypted metadata (spec §10, step 1/5).
-            let mut fixed = [0u8; NONCE_AND_META_LEN];
-            stream.read_exact(&mut fixed).await?;
-            let nonce: shadowlemon_crypto::WireNonce = fixed[..WIRE_NONCE_LEN]
-                .try_into()
-                .expect("fixed part has nonce length");
-            let auth = self
-                .registry
-                .discover(&nonce, &fixed[WIRE_NONCE_LEN..], Some(source_key))
-                .map_err(io_err)?;
-            let metadata = Metadata::parse(auth.plaintext()).map_err(io_err)?;
-            if metadata.protocol_type() != TYPE_OPEN_SESSION_REQUEST || metadata.session_id() == 0 {
-                auth.record(&self.registry);
-                return Err(invalid_data("unexpected handshake request metadata"));
-            }
-            let variable_len = usize::from(metadata.prefix_len())
-                + payload_block_len(usize::from(metadata.payload_len()))
-                + usize::from(metadata.suffix_len());
-            let mut variable = vec![0u8; variable_len];
-            stream.read_exact(&mut variable).await?;
-            let mut frame = fixed.to_vec();
-            frame.extend_from_slice(&variable);
-
-            let session_id = metadata.session_id();
-            let mut handshake = self.new_server_handshake(
-                session_id,
-                HandshakeTransport::Stream,
-                Some(source_key),
-            )?;
-            let result = handshake.accept(&frame).map_err(io_err)?;
-            match result {
-                ServerHandshakeResult::NoCommonSuite { response } => {
-                    stream.write_all(&response).await?;
-                    stream.flush().await?;
-                    Ok(())
-                }
-                ServerHandshakeResult::Established {
-                    response,
-                    session,
-                    piggyback,
-                    ..
-                } => {
-                    stream.write_all(&response).await?;
-                    stream.flush().await?;
-
-                    let mut request_bytes = &piggyback[..];
-                    let (request, raw) = read_request(&mut request_bytes).await.map_err(io_err)?;
-                    if request.command != CMD_CONNECT {
-                        return Err(invalid_data("piggyback must be a SOCKS5 CONNECT request"));
-                    }
-                    let outbound = self
-                        .dial_target(&request.address, request.port, &piggyback)
-                        .await?;
-                    let initial = &piggyback[raw.len()..];
-
-                    let state = Session::new(SessionConfig::new(
-                        session_id,
-                        Direction::Server,
-                        TransportMode::Stream,
-                        session.c2s_key,
-                        session.s2c_key,
-                    ))
-                    .map_err(io_err)?;
-                    let tunnel = TcpSessionStream::new(state, stream);
-                    debug!(session_id, %source, suite = %session.suite, "server TCP session established");
-                    self.relay_tcp(tunnel, outbound, initial).await
-                }
-            }
-        })
-    }
-
     fn accept_udp<'a>(
         &'a self,
         datagram: Vec<u8>,
         source: SocketAddr,
-    ) -> BoxFuture<'a, io::Result<Option<Vec<u8>>>> {
+    ) -> BoxFuture<'a, io::Result<Vec<Vec<u8>>>> {
         Box::pin(async move {
             let Some((kind, session_id, frame)) = unwrap_udp(&datagram) else {
                 return Err(invalid_data("malformed UDP routing envelope"));
@@ -740,34 +684,78 @@ impl mux::ServerHandshake for RealServerHandshake {
                     )?;
                     let result = handshake.accept(frame).map_err(io_err)?;
                     match result {
-                        ServerHandshakeResult::NoCommonSuite { response } => Ok(Some(wrap_udp(
+                        ServerHandshakeResult::NoCommonSuite { response } => Ok(vec![wrap_udp(
                             UDP_KIND_HANDSHAKE_RESPONSE,
                             session_id,
                             &response,
-                        ))),
+                        )]),
                         ServerHandshakeResult::Established {
                             response,
                             session,
+                            early_c2s_key,
+                            early_s2c_key,
                             piggyback,
                             ..
                         } => {
+                            let suite = session.suite;
+                            // Both peers derive the same early keys from the
+                            // authenticated static key, session id and suite.
+                            let (c2s, s2c) = (session.c2s_key, session.s2c_key);
+
                             let mut bytes = &piggyback[..];
-                            let target = if piggyback.is_empty() {
-                                None
-                            } else {
-                                let (request, _) =
+                            let mut target = None;
+                            let mut tcp = None;
+                            if !piggyback.is_empty() {
+                                let (request, raw) =
                                     read_request(&mut bytes).await.map_err(io_err)?;
-                                if request.command != CMD_UDP_ASSOCIATE {
-                                    return Err(invalid_data("piggyback must be UDP ASSOCIATE"));
-                                }
                                 let (ip, host) = resolve_address(&request.address).await?;
-                                Some((SocketAddr::new(ip, request.port), host))
-                            };
+                                let addr = SocketAddr::new(ip, request.port);
+                                match request.command {
+                                    CMD_UDP_ASSOCIATE => {
+                                        target = Some((addr, host));
+                                    }
+                                    CMD_CONNECT => {
+                                        // CONNECT-over-UDP: the handshake
+                                        // piggyback carries a SOCKS5 CONNECT and
+                                        // its early data. Dial the TCP target and
+                                        // relay its byte stream through the
+                                        // datagram session. Splitting the stream
+                                        // keeps the reply reader from blocking
+                                        // writes to the target.
+                                        let outbound = self
+                                            .dial_target(
+                                                &request.address,
+                                                request.port,
+                                                &piggyback[..raw.len()],
+                                            )
+                                            .await?;
+                                        let (read_half, mut write_half) =
+                                            tokio::io::split(outbound);
+                                        let initial = &piggyback[raw.len()..];
+                                        if !initial.is_empty() {
+                                            write_half.write_all(initial).await?;
+                                            write_half.flush().await?;
+                                        }
+                                        tcp = Some((
+                                            Box::new(write_half) as TcpWriteHalf,
+                                            Box::new(read_half) as TcpReadHalf,
+                                            addr,
+                                        ));
+                                        target = Some((addr, host));
+                                    }
+                                    _ => {
+                                        return Err(invalid_data(
+                                            "piggyback must be a SOCKS5 CONNECT or UDP ASSOCIATE request",
+                                        ));
+                                    }
+                                }
+                            }
                             let state = Arc::new(ServerUdpSession::new(
                                 session_id,
-                                session.c2s_key,
-                                session.s2c_key,
+                                *early_c2s_key,
+                                *early_s2c_key,
                                 target,
+                                tcp,
                                 MtuBudget::new(
                                     self.config.packet.mtu,
                                     IpFamily::from_addr(source.ip()),
@@ -779,12 +767,19 @@ impl mux::ServerHandshake for RealServerHandshake {
                             ));
                             self.udp_sessions
                                 .insert((source, session_id), Arc::clone(&state));
-                            debug!(session_id, %source, suite = %session.suite, "server UDP session established");
-                            Ok(Some(wrap_udp(
+                            // The mux sends the returned response immediately;
+                            // move the data plane to the forward-secret keys as
+                            // part of completing this handshake.
+                            {
+                                let mut guard = state.session.lock().await;
+                                guard.upgrade_keys(c2s, s2c);
+                            }
+                            debug!(session_id, %source, suite = %suite, "server UDP session established");
+                            Ok(vec![wrap_udp(
                                 UDP_KIND_HANDSHAKE_RESPONSE,
                                 session_id,
                                 &response,
-                            )))
+                            )])
                         }
                     }
                 }
@@ -820,7 +815,7 @@ impl mux::ServerHandshake for RealServerHandshake {
                     state
                         .collect_replies(session_id, wait, time::Instant::now() + wait)
                         .await;
-                    Ok(state.pop_frame().await)
+                    Ok(state.drain_frames().await)
                 }
                 _ => Err(invalid_data("unexpected UDP routing envelope kind")),
             }
@@ -835,6 +830,175 @@ struct UdpSessionHandle {
     socket: Arc<UdpSocket>,
     session: Arc<Mutex<Session>>,
     server: SocketAddr,
+    /// Wakes the handshake-response demultiplexer when the session closes.
+    shutdown: Arc<Notify>,
+}
+
+/// Gate that holds 0-RTT data-plane I/O until the key swap completes.
+///
+/// Data frames are never sent with early keys after the response has been
+/// processed (or received with final keys before it): ambiguous key epochs
+/// would make decryption fail nondeterministically. The CONNECT request itself
+/// is still sent in the first flight as handshake piggyback.
+struct KeyUpgradeState {
+    ready: AtomicBool,
+    failed: AtomicBool,
+    notify: Notify,
+}
+
+impl KeyUpgradeState {
+    fn new() -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    fn succeed(&self) {
+        self.ready.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) -> io::Result<()> {
+        loop {
+            if self.ready.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if self.failed.load(Ordering::Acquire) {
+                return Err(invalid_data("UDP stream handshake did not complete"));
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+/// Session-reply frames waiting to be decrypted by the tunnel socket.
+struct UdpInbound {
+    frames: Mutex<VecDeque<Vec<u8>>>,
+    ready: Notify,
+    shutdown: Arc<Notify>,
+}
+
+impl UdpInbound {
+    fn new(shutdown: Arc<Notify>) -> Self {
+        Self {
+            frames: Mutex::new(VecDeque::new()),
+            ready: Notify::new(),
+            shutdown,
+        }
+    }
+
+    async fn push(&self, frame: Vec<u8>) {
+        self.frames.lock().await.push_back(frame);
+        self.ready.notify_one();
+    }
+
+    async fn pop(&self) -> Option<Vec<u8>> {
+        loop {
+            if let Some(frame) = self.frames.lock().await.pop_front() {
+                return Some(frame);
+            }
+            tokio::select! {
+                _ = self.ready.notified() => {}
+                _ = self.shutdown.notified() => return None,
+            }
+        }
+    }
+}
+
+/// Demultiplex one socket's inbound datagrams between the handshake response
+/// and the session's encrypted replies. Without this, the key-upgrade task and
+/// the data-plane reader would race to consume the same UDP datagrams.
+fn spawn_udp_reader(
+    socket: Arc<UdpSocket>,
+    server: SocketAddr,
+    session_id: u32,
+    response_tx: oneshot::Sender<Vec<u8>>,
+    inbound: Arc<UdpInbound>,
+    shutdown: Arc<Notify>,
+) {
+    tokio::spawn(async move {
+        let mut response_tx = Some(response_tx);
+        let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
+        loop {
+            let (len, from) = tokio::select! {
+                received = socket.recv_from(&mut buf) => match received {
+                    Ok(result) => result,
+                    Err(_) => break,
+                },
+                _ = shutdown.notified() => break,
+            };
+            if from != server {
+                continue;
+            }
+            let Some((kind, id, frame)) = unwrap_udp(&buf[..len]) else {
+                continue;
+            };
+            if id != session_id {
+                continue;
+            }
+            match kind {
+                UDP_KIND_HANDSHAKE_RESPONSE => {
+                    if let Some(tx) = response_tx.take() {
+                        let _ = tx.send(frame.to_vec());
+                    }
+                }
+                UDP_KIND_SESSION_REPLY => inbound.push(frame.to_vec()).await,
+                _ => {}
+            }
+        }
+    });
+}
+
+/// Await the handshake response, install the forward-secret keys into the very
+/// same `Session` the stream is already using, and unblock data-plane I/O.
+fn spawn_stream_key_upgrade(
+    mut handshake: ClientHandshake,
+    response_rx: oneshot::Receiver<Vec<u8>>,
+    session: Arc<Mutex<Session>>,
+    key_state: Arc<KeyUpgradeState>,
+    handle: Arc<UdpSessionHandle>,
+    timeout: Duration,
+) {
+    let session_id = handle.session_id;
+    tokio::spawn(async move {
+        let response = match time::timeout(timeout, response_rx).await {
+            Ok(Ok(frame)) => frame,
+            _ => {
+                warn!(session_id, "UDP stream handshake response timed out");
+                key_state.fail();
+                RealClientHandshake::finish_udp_close(handle).await;
+                return;
+            }
+        };
+        match handshake.process_response(&response) {
+            Ok(ClientOutcome::Established(established)) => {
+                {
+                    let mut guard = session.lock().await;
+                    // Cross-file API: Session::upgrade_keys(c2s, s2c).
+                    guard.upgrade_keys(established.c2s_key, established.s2c_key);
+                }
+                debug!(session_id, suite = %established.suite, "UDP stream handshake completed");
+                key_state.succeed();
+            }
+            Ok(ClientOutcome::NoCommonSuite) => {
+                warn!("no common cipher suite with the server");
+                key_state.fail();
+                RealClientHandshake::finish_udp_close(handle).await;
+            }
+            Err(err) => {
+                warn!(session_id, %err, "UDP stream handshake failed");
+                key_state.fail();
+                RealClientHandshake::finish_udp_close(handle).await;
+            }
+        }
+    });
 }
 
 /// Drain frames queued by a session without ticking its timers.
@@ -942,7 +1106,7 @@ fn fragment_payload(data: &[u8], max_fragment: usize, id: u32) -> io::Result<Vec
         .collect())
 }
 
-/// Socket returned by `RealClientHandshake::open_udp`.
+/// Socket returned by `RealClientHandshake::open_udp` and `open_tcp`.
 struct TunnelDatagramSocket {
     socket: Arc<UdpSocket>,
     server: SocketAddr,
@@ -955,6 +1119,33 @@ struct TunnelDatagramSocket {
     recv_lock: Mutex<()>,
     pending: Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
     assembler: Mutex<FragmentMap>,
+    /// Set on the 0-RTT stream path: a shared reader has already consumed the
+    /// handshake response, so session replies arrive through this queue.
+    inbound: Option<Arc<UdpInbound>>,
+    /// Set on the 0-RTT stream path: data-plane I/O waits for the key swap.
+    key_state: Option<Arc<KeyUpgradeState>>,
+}
+
+impl TunnelDatagramSocket {
+    /// Decrypt one session-reply frame, send any ACKs it produced, and return
+    /// the reassembled application chunks.
+    async fn process_reply(&self, frame: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+        let chunks = {
+            let mut session = self.session.lock().await;
+            session.on_frame(frame, Instant::now()).map_err(io_err)?;
+            let chunks: Vec<Vec<u8>> = std::iter::from_fn(|| session.try_recv()).collect();
+            for ack in drain_output(&mut session) {
+                self.socket
+                    .send_to(
+                        &wrap_udp(UDP_KIND_SESSION_DATA, self.session_id, &ack),
+                        self.server,
+                    )
+                    .await?;
+            }
+            chunks
+        };
+        Ok(chunks)
+    }
 }
 
 impl DatagramSocket for TunnelDatagramSocket {
@@ -964,6 +1155,9 @@ impl DatagramSocket for TunnelDatagramSocket {
         target: SocketAddr,
     ) -> BoxFuture<'a, io::Result<usize>> {
         Box::pin(async move {
+            if let Some(key_state) = &self.key_state {
+                key_state.wait().await?;
+            }
             let address = match &self.host {
                 Some(host) if target == self.target => Address::Domain(host.clone()),
                 _ => Address::Ip(target.ip()),
@@ -1001,30 +1195,32 @@ impl DatagramSocket for TunnelDatagramSocket {
                     buf[..len].copy_from_slice(&payload[..len]);
                     return Ok((len, source));
                 }
-                let mut wire = vec![0u8; MAX_UDP_DATAGRAM];
-                let (len, from) = self.socket.recv_from(&mut wire).await?;
-                if from != self.server {
-                    continue;
-                }
-                let Some((kind, id, frame)) = unwrap_udp(&wire[..len]) else {
-                    continue;
-                };
-                if kind != UDP_KIND_SESSION_REPLY || id != self.session_id {
-                    continue;
-                }
-                let chunks = {
-                    let mut session = self.session.lock().await;
-                    session.on_frame(frame, Instant::now()).map_err(io_err)?;
-                    let chunks: Vec<Vec<u8>> = std::iter::from_fn(|| session.try_recv()).collect();
-                    for ack in drain_output(&mut session) {
-                        self.socket
-                            .send_to(
-                                &wrap_udp(UDP_KIND_SESSION_DATA, self.session_id, &ack),
-                                self.server,
-                            )
-                            .await?;
+                let chunks = if let Some(inbound) = &self.inbound {
+                    if let Some(key_state) = &self.key_state {
+                        key_state.wait().await?;
                     }
-                    chunks
+                    match inbound.pop().await {
+                        Some(frame) => self.process_reply(&frame).await?,
+                        None => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "UDP stream session closed",
+                            ))
+                        }
+                    }
+                } else {
+                    let mut wire = vec![0u8; MAX_UDP_DATAGRAM];
+                    let (len, from) = self.socket.recv_from(&mut wire).await?;
+                    if from != self.server {
+                        continue;
+                    }
+                    let Some((kind, id, frame)) = unwrap_udp(&wire[..len]) else {
+                        continue;
+                    };
+                    if kind != UDP_KIND_SESSION_REPLY || id != self.session_id {
+                        continue;
+                    }
+                    self.process_reply(frame).await?
                 };
                 for chunk in chunks {
                     let Some((message, number, count, piece)) = split_app_fragment(&chunk) else {
@@ -1063,6 +1259,8 @@ struct ServerUdpSession {
     session: Arc<Mutex<Session>>,
     target: Mutex<Option<(SocketAddr, Option<String>)>>,
     outbound: Mutex<Option<Arc<UdpSocket>>>,
+    /// CONNECT-over-UDP egress: the write half of the dialed TCP stream.
+    tcp_outbound: Mutex<Option<TcpWriteHalf>>,
     assembler: Mutex<FragmentMap>,
     replies: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
     reply_tx: mpsc::UnboundedSender<Vec<u8>>,
@@ -1077,9 +1275,14 @@ impl ServerUdpSession {
         c2s_key: shadowlemon_crypto::aead::AeadKey,
         s2c_key: shadowlemon_crypto::aead::AeadKey,
         target: Option<(SocketAddr, Option<String>)>,
+        tcp: Option<(TcpWriteHalf, TcpReadHalf, SocketAddr)>,
         max_fragment: usize,
     ) -> Self {
         let (reply_tx, replies) = mpsc::unbounded_channel();
+        let tcp_outbound = tcp.map(|(write_half, read_half, source)| {
+            spawn_tcp_reply_reader(read_half, source, reply_tx.clone());
+            write_half
+        });
         Self {
             session: Arc::new(Mutex::new(
                 Session::new(SessionConfig::new(
@@ -1093,6 +1296,7 @@ impl ServerUdpSession {
             )),
             target: Mutex::new(target),
             outbound: Mutex::new(None),
+            tcp_outbound: Mutex::new(tcp_outbound),
             assembler: Mutex::new(HashMap::new()),
             replies: Mutex::new(replies),
             reply_tx,
@@ -1118,11 +1322,16 @@ impl ServerUdpSession {
         self.pending_frames.lock().await.push_back(frame);
     }
 
-    async fn pop_frame(&self) -> Option<Vec<u8>> {
-        self.pending_frames.lock().await.pop_front()
+    async fn drain_frames(&self) -> Vec<Vec<u8>> {
+        self.pending_frames.lock().await.drain(..).collect()
     }
 
     async fn send_payload(&self, target: SocketAddr, payload: &[u8]) -> io::Result<()> {
+        if let Some(stream) = self.tcp_outbound.lock().await.as_mut() {
+            stream.write_all(payload).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
         let socket = {
             let mut outbound = self.outbound.lock().await;
             if let Some(socket) = outbound.as_ref() {
@@ -1209,6 +1418,32 @@ fn spawn_udp_reply_reader(socket: Arc<UdpSocket>, tx: mpsc::UnboundedSender<Vec<
                     warn!(%error, "UDP relay receive failed");
                     break;
                 }
+            };
+            let mut datagram = encode_udp_header(&Address::Ip(source.ip()), source.port());
+            datagram.extend_from_slice(&buf[..len]);
+            if tx.send(datagram).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Relay the read half of a dialed TCP target into the CONNECT-over-UDP reply
+/// queue. Bytes are wrapped in a SOCKS5 UDP header so the client side's
+/// datagram socket can hand them to the byte-stream facade as ordinary
+/// application data. The write half stays with the session; the two halves are
+/// independent so a blocking read never stalls outgoing writes.
+fn spawn_tcp_reply_reader(
+    mut stream: TcpReadHalf,
+    source: SocketAddr,
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
+        loop {
+            let len = match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(len) => len,
             };
             let mut datagram = encode_udp_header(&Address::Ip(source.ip()), source.port());
             datagram.extend_from_slice(&buf[..len]);
@@ -1311,7 +1546,10 @@ async fn read_socks5_address_tail(stream: &mut TcpStream, address_type: u8) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shadowlemon_crypto::{kdf::hash_password, WireNonce};
+    use shadowlemon_crypto::{
+        kdf::{derive_static_key, hash_password},
+        WireNonce,
+    };
 
     fn user(name: &str, password: &str) -> User {
         User::from_password(name, password, Vec::new()).expect("valid user")
@@ -1378,7 +1616,6 @@ mod tests {
             username: "alice".to_owned(),
             credential: ClientCredential::Password("secret".to_owned()),
             suites: vec![Suite::XChaCha20Poly1305],
-            stream: StreamConfig::default(),
             packet: PacketConfig::default(),
             handshake_timeout: Duration::from_secs(10),
         };

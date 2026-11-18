@@ -1,25 +1,23 @@
-//! Core abstractions for the ShadowLemon V0.2 underlay transports.
+//! Core abstractions for the ShadowLemon V0.2 UDP underlay transport.
 //!
-//! This module owns the parts of the data plane that are common to TCP and
-//! UDP (spec `protocol-v0.2.md` §4, §10; `reference-go-v3.md` §7):
+//! This module owns the parts of the data plane shared by the wire and driver
+//! layers (spec `protocol-v0.2.md` §4, §10; `reference-go-v3.md` §7):
 //!
-//! * [`Underlay`] – the async read/write interface implemented by both
-//!   transports, with per-direction [`NonceChain`] state for TCP.
+//! * [`Underlay`] – the async read/write interface implemented by the UDP
+//!   underlay, which draws a fresh nonce per datagram.
 //! * [`WireCipher`] – adapts the crypto crate's `AeadKey` to the wire crate's
 //!   `Cipher` trait (the AEAD nonce is always the *suffix* of the wire nonce).
-//! * [`NonceChain`] / [`NoncePattern`] – the 24-byte big-endian TCP counter
-//!   with implicit continuation, and traffic-pattern rewriting of at most 12
-//!   leading nonce bytes. Bytes `wireNonce[12:24]` are **never** rewritten, so
-//!   AES-GCM never sees a deterministic nonce.
+//! * [`NoncePattern`] – traffic-pattern rewriting of at most 12 leading nonce
+//!   bytes. Bytes `wireNonce[12:24]` are **never** rewritten, so AES-GCM never
+//!   sees a deterministic nonce.
 //! * MTU budgeting – [`udp_payload_budget`] subtracts 28 (IPv4) or 48 (IPv6)
 //!   bytes from the configured L3 MTU; [`MtuBudget`] turns that into a maximum
 //!   application fragment size via the wire crate's `frame_len` helpers.
 //! * [`fragment`] / [`FragmentReassembler`] – application-data fragmentation
-//!   across segments and datagrams, using the metadata fragment counter that
-//!   counts down to `0` for the final fragment.
+//!   across datagrams, using the metadata fragment counter that counts down to
+//!   `0` for the final fragment.
 //!
-//! The concrete Tokio transports live in [`crate::underlay_stream`] and
-//! [`crate::underlay_packet`].
+//! The concrete Tokio transport lives in [`crate::underlay_packet`].
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -32,8 +30,7 @@ use std::{
 use futures::future::BoxFuture;
 use shadowlemon_crypto::{aead::AeadKey, WireNonce};
 use shadowlemon_wire::{
-    frame_len, increment_nonce, Cipher, CipherError, Segment, META_BLOCK_LEN, NONCE_AND_META_LEN,
-    WIRE_NONCE_LEN,
+    frame_len, Cipher, CipherError, Segment, META_BLOCK_LEN, NONCE_AND_META_LEN, WIRE_NONCE_LEN,
 };
 
 /// Default L3 MTU from `reference-go-v3.md` §0 (`DefaultMTU`).
@@ -75,7 +72,7 @@ pub enum UnderlayError {
     /// The AEAD rejected a block.
     #[error("cipher error: {0}")]
     Cipher(#[from] CipherError),
-    /// The peer closed the stream before any byte of a frame arrived.
+    /// The peer closed the connection before any byte of a frame arrived.
     #[error("connection closed")]
     Closed,
     /// A partial frame was followed by EOF.
@@ -134,8 +131,6 @@ pub type UnderlayResult<T> = Result<T, UnderlayError>;
 /// Transport kind of an underlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnderlayKind {
-    /// Ordered byte stream (TCP or a SOCKS5 CONNECT tunnel).
-    Stream,
     /// Unreliable datagrams (UDP).
     Packet,
 }
@@ -143,24 +138,20 @@ pub enum UnderlayKind {
 impl fmt::Display for UnderlayKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Stream => "TCP",
             Self::Packet => "UDP",
         })
     }
 }
 
-/// Async read/write interface shared by the TCP and UDP underlays.
+/// Async read/write interface for the UDP underlay.
 ///
-/// Both transports keep their cipher-chain state internally: a TCP underlay
-/// owns independent send/receive [`NonceChain`]s, while a UDP underlay draws a
-/// fresh nonce per datagram. `install_session_cipher` is called once the V0.2
-/// handshake completes; on a stream it also resets both chains, so the next
-/// frame again carries an explicit 24-byte nonce (spec §4.3).
+/// The underlay draws a fresh nonce per datagram. `install_session_cipher` is
+/// called once the V0.2 handshake completes (spec §4.3).
 pub trait Underlay: Send {
     /// Transport kind.
     fn kind(&self) -> UnderlayKind;
 
-    /// Configured L3 MTU, or `None` for a stream underlay.
+    /// Configured L3 MTU for the datagram underlay.
     fn mtu(&self) -> Option<u16>;
 
     /// Send one encrypted segment, updating the outbound nonce state.
@@ -169,8 +160,7 @@ pub trait Underlay: Send {
     /// Receive one encrypted segment, updating the inbound nonce state.
     fn recv_segment(&mut self) -> BoxFuture<'_, UnderlayResult<Segment>>;
 
-    /// Replace the handshake (static-key) cipher with the session cipher and
-    /// start a fresh cipher chain.
+    /// Replace the handshake (static-key) cipher with the session cipher.
     fn install_session_cipher(&mut self, key: AeadKey);
 
     /// Flush and close the underlying transport.
@@ -233,95 +223,6 @@ impl Cipher for WireCipher {
 impl From<AeadKey> for WireCipher {
     fn from(key: AeadKey) -> Self {
         Self::new(key)
-    }
-}
-
-/// One direction of the TCP 24-byte big-endian nonce counter (spec §4.2).
-///
-/// The first message of a chain carries the counter explicitly; every later
-/// message reuses the receiver's implicit copy. Metadata consumes the current
-/// value, a non-empty payload consumes the following value; both are
-/// incremented after use.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NonceChain {
-    current: WireNonce,
-    first_message: bool,
-}
-
-impl NonceChain {
-    /// Start a chain from an explicit nonce (received, or freshly generated).
-    #[must_use]
-    pub const fn new(nonce: WireNonce) -> Self {
-        Self {
-            current: nonce,
-            first_message: true,
-        }
-    }
-
-    /// Start a chain with a fresh random nonce, optionally rewritten by a
-    /// traffic pattern in the first 12 bytes.
-    #[must_use]
-    pub fn fresh(pattern: Option<&NoncePattern>) -> Self {
-        Self::new(new_wire_nonce(pattern))
-    }
-
-    /// Whether the next frame must carry the explicit 24-byte nonce.
-    #[must_use]
-    pub const fn should_include_nonce(&self) -> bool {
-        self.first_message
-    }
-
-    /// Nonce for the metadata block being sent; advances the chain.
-    #[must_use]
-    pub fn send_metadata_nonce(&mut self) -> WireNonce {
-        let nonce = self.current;
-        self.current = increment_nonce(&nonce);
-        self.first_message = false;
-        nonce
-    }
-
-    /// Nonce for a received metadata block. The first message supplies it
-    /// explicitly; later messages use the implicit counter.
-    #[must_use]
-    pub fn recv_metadata_nonce(&mut self, explicit: Option<WireNonce>) -> WireNonce {
-        let nonce = match explicit {
-            Some(nonce) => {
-                self.current = increment_nonce(&nonce);
-                nonce
-            }
-            None => {
-                let nonce = self.current;
-                self.current = increment_nonce(&nonce);
-                nonce
-            }
-        };
-        self.first_message = false;
-        nonce
-    }
-
-    /// Nonce for a non-empty payload; advances the chain.
-    #[must_use]
-    pub fn payload_nonce(&mut self) -> WireNonce {
-        let nonce = self.current;
-        self.current = increment_nonce(&nonce);
-        nonce
-    }
-
-    /// Consume the payload nonce slot after a frame with a body was decoded.
-    pub fn advance_payload(&mut self) {
-        self.current = increment_nonce(&self.current);
-    }
-
-    /// Current counter value (the nonce a chain-later frame will use).
-    #[must_use]
-    pub const fn current(&self) -> &WireNonce {
-        &self.current
-    }
-
-    /// Reset the chain, e.g. after the handshake switches to session keys.
-    pub fn reset(&mut self, nonce: WireNonce) {
-        self.current = nonce;
-        self.first_message = true;
     }
 }
 
@@ -709,81 +610,6 @@ impl<K: Eq + Hash + Clone> FragmentReassembler<K> {
 mod tests {
     use super::*;
     use shadowlemon_wire::{payload_block_len, Metadata};
-
-    fn cipher() -> WireCipher {
-        WireCipher::new(
-            AeadKey::new(
-                shadowlemon_crypto::suite::Suite::XChaCha20Poly1305,
-                &[7u8; 32],
-            )
-            .unwrap(),
-        )
-    }
-
-    #[test]
-    fn nonce_chain_first_message_then_implicit() {
-        let mut chain = NonceChain::new([0x11; WIRE_NONCE_LEN]);
-        assert!(chain.should_include_nonce());
-        let meta = chain.send_metadata_nonce();
-        assert_eq!(meta, [0x11; WIRE_NONCE_LEN]);
-        assert!(!chain.should_include_nonce());
-
-        let mut expected = [0x11; WIRE_NONCE_LEN];
-        expected[23] = 0x12;
-        assert_eq!(chain.current(), &expected);
-        assert_eq!(chain.payload_nonce(), expected);
-        expected[23] = 0x13;
-        assert_eq!(chain.current(), &expected);
-
-        chain.reset([0x42; WIRE_NONCE_LEN]);
-        assert!(chain.should_include_nonce());
-        assert_eq!(
-            chain.recv_metadata_nonce(Some([0x42; WIRE_NONCE_LEN])),
-            [0x42; WIRE_NONCE_LEN]
-        );
-        let mut implicit = [0x42; WIRE_NONCE_LEN];
-        implicit[23] = 0x43;
-        assert_eq!(chain.recv_metadata_nonce(None), implicit);
-    }
-
-    #[test]
-    fn nonce_chain_matches_wire_framing() {
-        let key = cipher();
-        let mut send = NonceChain::fresh(None);
-        for with_payload in [false, true] {
-            let meta_nonce = send.send_metadata_nonce();
-            let payload = if with_payload {
-                vec![1u8, 2, 3]
-            } else {
-                Vec::new()
-            };
-            let meta = Metadata::data(6, 1, 0, 0, 16, 0, 0, payload.len() as u16, 0);
-            let segment = Segment::new(meta, meta_nonce, payload);
-            let encoded = shadowlemon_wire::encode_segment(
-                &key,
-                &segment,
-                &shadowlemon_wire::EncodeOptions {
-                    include_nonce: true,
-                    payload_nonce: shadowlemon_wire::PayloadNonce::TcpIncrement,
-                },
-            )
-            .unwrap();
-            let decoded = shadowlemon_wire::decode_segment(
-                &key,
-                &encoded,
-                &shadowlemon_wire::DecodeOptions {
-                    include_nonce: true,
-                    implicit_metadata_nonce: meta_nonce,
-                    payload_nonce: shadowlemon_wire::PayloadNonce::TcpIncrement,
-                },
-            )
-            .unwrap();
-            assert_eq!(decoded, segment);
-            if with_payload {
-                send.advance_payload();
-            }
-        }
-    }
 
     #[test]
     fn traffic_pattern_never_touches_aead_nonce_region() {

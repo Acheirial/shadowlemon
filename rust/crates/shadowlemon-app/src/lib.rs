@@ -431,7 +431,6 @@ mod tests {
         mux::{ClientMux, Endpoint, MuxConfig, PortBindingSpec, ServerMux, TransportKind},
         serveruser::User,
         underlay_packet::PacketConfig,
-        underlay_stream::StreamConfig,
         ClientCredential, RealClientConfig, RealClientHandshake, RealServerConfig,
         RealServerHandshake,
     };
@@ -460,7 +459,6 @@ mod tests {
             username: "alice".to_owned(),
             credential: ClientCredential::Password("secret".to_owned()),
             suites: vec![suite],
-            stream: StreamConfig::default(),
             packet: PacketConfig::default(),
             handshake_timeout: Duration::from_secs(3),
         }
@@ -507,7 +505,7 @@ mod tests {
         let server_mux = ServerMux::new(
             mux_config(),
             "127.0.0.1".parse().unwrap(),
-            vec![PortBindingSpec::new(port, TransportKind::Tcp)],
+            vec![PortBindingSpec::new(port, TransportKind::Udp)],
             Arc::new(RealServerHandshake::new(server_config(suite)).unwrap()),
         )
         .unwrap();
@@ -517,7 +515,7 @@ mod tests {
             mux_config(),
             vec![Endpoint::new(
                 "127.0.0.1",
-                vec![PortBindingSpec::new(port, TransportKind::Tcp)],
+                vec![PortBindingSpec::new(port, TransportKind::Udp)],
             )],
             Box::new(RealClientHandshake::new(client_config(suite)).unwrap()),
         )

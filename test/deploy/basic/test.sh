@@ -20,6 +20,10 @@
 
 set -e
 
+# All scenarios are UDP-based: the external transport is UDP-only. SOCKS5
+# CONNECT (TCP targets) is carried over the UDP tunnel's reliable layer, and
+# UDP ASSOCIATE is carried as datagrams. No external TCP port bindings exist.
+
 # Load test library.
 source ./libtest.sh
 
@@ -31,17 +35,17 @@ sleep 2
 ./udpserver -port=9090 &
 sleep 1
 
-# Run TCP test.
-echo "========== BEGIN OF TCP TEST =========="
+# Run SOCKS5 CONNECT over UDP tunnel test (script name kept for compatibility).
+echo "========== BEGIN OF CONNECT OVER UDP TUNNEL TEST =========="
 ./test_tcp.sh
-echo "==========  END OF TCP TEST  =========="
+echo "==========  END OF CONNECT OVER UDP TUNNEL TEST  =========="
 
-# Run UDP test.
+# Run UDP associate test.
 echo "========== BEGIN OF UDP TEST =========="
 ./test_udp.sh
 echo "==========  END OF UDP TEST  =========="
 
-# Run UDP associate test.
+# Run UDP associate test (mixed UDP port bindings).
 echo "========== BEGIN OF UDP ASSOCIATE TEST =========="
 ./test_mix_udp_associate.sh
 echo "==========  END OF UDP ASSOCIATE TEST  =========="

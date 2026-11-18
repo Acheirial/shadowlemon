@@ -1,6 +1,8 @@
 # 服务器安装与配置
 
 > **本版本线协议版本为 4；两端必须使用同一版本，否则会话会在握手阶段失败。**
+>
+> **外部传输为 UDP-only**：所有端口绑定都必须使用 `"protocol": "UDP"`，TCP 绑定会被配置校验拒绝（"TCP external transport has been removed; use protocol UDP"）。SOCKS5 CONNECT（TCP 目标）通过 UDP 隧道的可靠层承载；握手为 0-RTT，early data 无前向安全。
 
 代理服务器软件 `shadowlemon server` 需要运行在 Linux 系统中。
 
@@ -47,7 +49,7 @@ ExecStart=/usr/bin/shadowlemon server run
 
 ## 修改代理服务器设置
 
-shadowlemon 代理支持 TCP 和 UDP 两种不同的传输协议。要了解协议之间的差别，请阅读 [ShadowLemon V0.2 协议规范](../rust/docs/protocol-v0.2.md)。
+shadowlemon 代理的外部传输**只支持 UDP**。SOCKS5 CONNECT（TCP 目标）走 UDP 隧道内的可靠层，UDP ASSOCIATE 走数据报；不再有独立的 TCP 外部传输。要了解协议细节，请阅读 [ShadowLemon V0.2 协议规范](../rust/docs/protocol-v0.2.md)。
 
 用户可以通过
 
@@ -70,11 +72,11 @@ shadowlemon server replace config <FILE>
     "portBindings": [
         {
             "portRange": "2012-2022",
-            "protocol": "TCP"
+            "protocol": "UDP"
         },
         {
             "port": 2027,
-            "protocol": "TCP"
+            "protocol": "UDP"
         }
     ],
     "users": [
@@ -97,8 +99,8 @@ shadowlemon server replace config <FILE>
 }
 ```
 
-1. `portBindings` -> `port` 属性是 shadowlemon server 监听的 TCP 或 UDP 端口号，请指定一个从 1025 到 65535 之间的值。如果想要监听连续的端口号，也可以改为使用 `portRange` 属性。**请确保防火墙允许使用这些端口进行通信。**
-2. `portBindings` -> `protocol` 属性可以使用 `TCP` 或者 `UDP`。
+1. `portBindings` -> `port` 属性是 shadowlemon server 监听的 UDP 端口号，请指定一个从 1025 到 65535 之间的值。如果想要监听连续的端口号，也可以改为使用 `portRange` 属性。**请确保防火墙允许 UDP 使用这些端口进行通信。**
+2. `portBindings` -> `protocol` 属性只能使用 `UDP`。填 `TCP` 会在配置校验时被拒绝。
 3. 在 `users` -> `name` 属性中填写用户名。
 4. 在 `users` -> `password` 属性中填写该用户的密码。
 5. 【可选】`mtu` 属性是使用 UDP 代理协议时网络路径的 L3 MTU，即能够通过的最大 IP 报文长度，取值范围是 1280 到 1500，默认值是 1400。UDP 的有效载荷预算会在此基础上另外扣除 IP 报文头与 UDP 报文头（IPv6 下最多 48 字节，即 40 字节 IPv6 头加 8 字节 UDP 头）。服务器与客户端必须使用相同的值。
@@ -202,7 +204,7 @@ sudo chown -R shadowlemon:shadowlemon /etc/shadowlemon /var/run/shadowlemon
 
 ### BBR 拥塞控制算法
 
-[BBR](https://en.wikipedia.org/wiki/TCP_congestion_control#TCP_BBR) 是一种不依赖于丢包的拥塞控制算法。在恶劣的网络情况下，使用 BBR 的网络传输速度比传统算法更快。
+[BBR](https://en.wikipedia.org/wiki/TCP_congestion_control#TCP_BBR) 是一种不依赖于丢包的拥塞控制算法。在恶劣的网络情况下，使用 BBR 的网络传输速度比传统算法更快。**注意**：shadowlemon 的外部传输是 UDP-only，BBR 是内核 TCP 拥塞控制算法，不影响 UDP 隧道本身；它只对服务器上其他 TCP 流量（例如本地目标连接）有意义。
 
 编辑 `/etc/sysctl.conf`，加入以下内容，然后执行 `sudo sysctl -p` 生效。
 
@@ -277,7 +279,7 @@ shadowlemon 客户端 -> 互联网 -> shadowlemon 服务器 -> cloudflare 代理
 
 如果需要允许用户通过代理服务器访问服务器本机，例如 `127.0.0.1`，请设置 `users` -> `allowLoopbackIP` 属性。
 
-上述限制对 TCP 连接和 UDP 数据报同时生效：未开启对应权限的用户，无论使用哪种传输协议，都无法访问受限地址。TCP 连接在解析域名之后，会按解析出的 IP 地址**再复查一次**同一套策略（与 UDP 数据报对每个目标地址的检查一致），因此借助指向受限地址的域名（例如 `127-0-0-1.nip.io`）无法绕过限制。此外，socks5 请求声明的地址类型为域名（`ATYP` = 3）而地址长度为 0 时，请求会被直接拒绝：它既不会被当作 `DIRECT`，也不参与出站规则的匹配。被拒绝的目标包括回环地址、私有地址（RFC 1918 / RFC 4193）、链路本地地址（RFC 3927 / RFC 4291，其中包含云服务商的元数据地址 `169.254.169.254`）、CGNAT 地址（`100.64.0.0/10`）以及未指定地址（`0.0.0.0` / `::`）。
+上述限制对 SOCKS5 CONNECT（TCP 目标，承载在 UDP 隧道可靠层上）和 UDP associate 数据报同时生效：未开启对应权限的用户，无论使用哪种 SOCKS5 请求，都无法访问受限地址。CONNECT 在解析域名之后，会按解析出的 IP 地址**再复查一次**同一套策略（与 UDP associate 数据报对每个目标地址的检查一致），因此借助指向受限地址的域名（例如 `127-0-0-1.nip.io`）无法绕过限制。此外，socks5 请求声明的地址类型为域名（`ATYP` = 3）而地址长度为 0 时，请求会被直接拒绝：它既不会被当作 `DIRECT`，也不参与出站规则的匹配。被拒绝的目标包括回环地址、私有地址（RFC 1918 / RFC 4193）、链路本地地址（RFC 3927 / RFC 4291，其中包含云服务商的元数据地址 `169.254.169.254`）、CGNAT 地址（`100.64.0.0/10`）以及未指定地址（`0.0.0.0` / `::`）。
 
 ```js
 {

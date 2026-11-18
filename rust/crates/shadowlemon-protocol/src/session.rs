@@ -1,11 +1,11 @@
 //! Data-plane session core for ShadowLemon V0.2 (spec §4, reference §2).
 //!
-//! A [`Session`] owns the two directional AEAD keys, the implicit TCP nonce
-//! chains (or the per-datagram UDP nonce), the sliding window, the ACK and
-//! retransmission timers, CUBIC, RTT estimation and one replay cache. It does
-//! not own a socket: the caller drives it with [`Session::on_frame`],
-//! [`Session::tick`], [`Session::poll_output`] and [`Session::send`], which
-//! keeps it usable by both the stream and the datagram underlays.
+//! A [`Session`] owns the two directional AEAD keys, the per-datagram UDP
+//! nonce, the sliding window, the ACK and retransmission timers, CUBIC, RTT
+//! estimation and one replay cache. It does not own a socket: the caller
+//! drives it with [`Session::on_frame`], [`Session::tick`],
+//! [`Session::poll_output`] and [`Session::send`], which keeps it usable by
+//! the datagram underlay.
 //!
 //! Replay ordering is strict (spec §10): the signature is checked read-only
 //! *before* any decryption, and it is recorded only after the metadata, the
@@ -49,7 +49,7 @@ pub const SEGMENT_TREE_CAPACITY: usize = 4096;
 pub const SEGMENT_SEND_QUEUE_TREE_CAPACITY: usize = 1024;
 /// Capacity of the plaintext channel handed to the application.
 pub const SEGMENT_CHAN_CAPACITY: usize = 256;
-/// Hard limit of undelivered segments before a stream session is closed.
+/// Hard limit of undelivered segments before a session is closed.
 pub const MAX_UNREAD_SEGMENTS: usize = 512;
 /// Delayed ACK window for packet transport.
 pub const PACKET_ACK_DELAY: Duration = Duration::from_millis(1);
@@ -129,18 +129,15 @@ impl Direction {
 
     fn replay_domain(self, mode: TransportMode) -> ReplayDomain {
         match (mode, self) {
-            (TransportMode::Stream, _) => ReplayDomain::Tcp,
             (TransportMode::Datagram, Self::Client) => ReplayDomain::UdpServerToClient,
             (TransportMode::Datagram, Self::Server) => ReplayDomain::UdpClientToServer,
         }
     }
 }
 
-/// Byte-stream (TCP) or datagram (UDP) framing.
+/// Datagram (UDP) framing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportMode {
-    /// First message of each cipher chain carries a nonce; later ones do not.
-    Stream,
     /// Every datagram carries its own nonce.
     Datagram,
 }
@@ -197,7 +194,7 @@ pub enum SessionError {
     /// Invalid local configuration.
     #[error("invalid session configuration: {0}")]
     Configuration(String),
-    /// Underlying byte stream failed.
+    /// Underlying I/O failed.
     #[error("I/O error: {0}")]
     Io(String),
 }
@@ -232,7 +229,7 @@ pub struct SessionConfig {
     pub session_id: SessionId,
     /// Local role.
     pub direction: Direction,
-    /// Framing mode.
+    /// Framing mode; always [`TransportMode::Datagram`] in this UDP-only build.
     pub mode: TransportMode,
     /// Client-to-server data key.
     pub c2s_key: AeadKey,
@@ -246,6 +243,9 @@ pub struct SessionConfig {
 
 impl SessionConfig {
     /// Build a configuration with no low-entropy mode and no source tag.
+    ///
+    /// `mode` is retained for call-site stability but this build only supports
+    /// [`TransportMode::Datagram`]; every datagram carries its own nonce.
     #[must_use]
     pub const fn new(
         session_id: SessionId,
@@ -349,6 +349,21 @@ pub struct Session {
 }
 
 impl Session {
+    /// Replace the data-plane keys after the handshake completes.
+    ///
+    /// The session is created with 0-RTT early keys so the client can send
+    /// application data in the first flight. Once the X25519 exchange finishes,
+    /// both peers call this with the forward-secret session keys. UDP frames
+    /// carry explicit nonces, so no nonce state needs to be rewritten here.
+    pub fn upgrade_keys(&mut self, c2s_key: AeadKey, s2c_key: AeadKey) {
+        let (send_key, recv_key) = match self.direction {
+            Direction::Client => (c2s_key, s2c_key),
+            Direction::Server => (s2c_key, c2s_key),
+        };
+        self.send_chain.cipher = AeadCipher::new(send_key);
+        self.recv_chain.cipher = AeadCipher::new(recv_key);
+    }
+
     /// Install the data-plane keys returned by a handshake.
     pub fn new(config: SessionConfig) -> Result<Self, SessionError> {
         if config.session_id == 0 {
@@ -397,11 +412,7 @@ impl Session {
             segments_since_window_ack: 0,
             state: SessionState::Active,
             low_entropy_mode: config.low_entropy_mode,
-            source_tag: if config.mode == TransportMode::Stream {
-                SourceTag::EMPTY
-            } else {
-                config.source_tag
-            },
+            source_tag: config.source_tag,
         })
     }
 
@@ -684,8 +695,7 @@ impl Session {
         };
 
         // Step 2 of spec §10: read-only replay check, before decryption.
-        // TCP only checks the first frame of each cipher chain (§8.4); later
-        // frames have implicit nonces whose repetition fails authentication.
+        // Every UDP datagram carries its own nonce, so every frame is checked.
         let sig = self.replay.signature(&nonce);
         if include_nonce {
             match self.replay.check(sig, self.source_tag) {
@@ -694,11 +704,7 @@ impl Session {
             }
         }
 
-        let payload_nonce = if self.mode == TransportMode::Stream {
-            shadowlemon_wire::PayloadNonce::Explicit(increment_nonce(&nonce))
-        } else {
-            shadowlemon_wire::PayloadNonce::UdpFlip
-        };
+        let payload_nonce = shadowlemon_wire::PayloadNonce::UdpFlip;
         let options = shadowlemon_wire::DecodeOptions {
             include_nonce,
             implicit_metadata_nonce: nonce,
@@ -742,7 +748,7 @@ impl Session {
         Ok(())
     }
 
-    /// Read one complete frame from a stream underlay and process it.
+    /// Read one complete frame from a byte-oriented reader and process it.
     ///
     /// The fixed prefix is read first so the replay check can run before the
     /// metadata is decrypted. The length of the variable part comes from the
@@ -758,8 +764,8 @@ impl Session {
         } else {
             (self.recv_chain.nonce, false)
         };
-        // Read-only replay check before decrypting metadata. TCP checks only
-        // the first frame of a cipher chain (see `on_frame`).
+        // Read-only replay check before decrypting metadata; every datagram
+        // carries its own nonce (see `on_frame`).
         let sig = self.replay.signature(&nonce);
         if include_nonce && self.replay.check(sig, self.source_tag).is_replay() {
             return Err(SessionError::Replay);
@@ -982,11 +988,7 @@ impl Session {
         suffix_padding: Vec<u8>,
     ) -> Result<Vec<u8>, SessionError> {
         let (nonce, include_nonce) = self.send_chain.outgoing_nonce();
-        let payload_nonce = if self.mode == TransportMode::Stream {
-            shadowlemon_wire::PayloadNonce::Explicit(increment_nonce(&nonce))
-        } else {
-            shadowlemon_wire::PayloadNonce::UdpFlip
-        };
+        let payload_nonce = shadowlemon_wire::PayloadNonce::UdpFlip;
         let mut segment = shadowlemon_wire::Segment::new(metadata, nonce, payload.to_vec());
         segment.prefix_padding = prefix_padding;
         segment.suffix_padding = suffix_padding;
@@ -1000,7 +1002,7 @@ impl Session {
     }
 }
 
-/// A stream-mode nonce is always 24 bytes.
+/// A wire nonce is always 24 bytes.
 const WIRE_LEN: usize = shadowlemon_wire::WIRE_NONCE_LEN;
 
 /// Serial-number comparison: `a < b` in wrapping 32-bit space.
@@ -1096,7 +1098,7 @@ mod tests {
 
     #[test]
     fn data_exchanges_in_both_directions() {
-        let (mut client, mut server) = pair(TransportMode::Stream);
+        let (mut client, mut server) = pair(TransportMode::Datagram);
         let now = Instant::now();
 
         assert_eq!(client.try_send(b"hello").unwrap(), 5);
@@ -1164,7 +1166,7 @@ mod tests {
 
     #[test]
     fn retransmission_fires_after_timeout() {
-        let (mut client, mut server) = pair(TransportMode::Stream);
+        let (mut client, mut server) = pair(TransportMode::Datagram);
         let now = Instant::now();
         client.try_send(b"loss").unwrap();
         let first = pump_until_outgoing(&mut client, now);
@@ -1182,7 +1184,7 @@ mod tests {
 
     #[test]
     fn heartbeat_fires_on_timer_without_sleeping() {
-        let (mut client, _) = pair(TransportMode::Stream);
+        let (mut client, _) = pair(TransportMode::Datagram);
         let deadline = client.next_timer().expect("heartbeat timer");
         client.tick(deadline).unwrap();
         assert!(client.has_output());
@@ -1220,8 +1222,13 @@ mod tests {
 
     #[test]
     fn fragmented_data_respects_low_entropy_mode_one_limit() {
-        let mut config =
-            SessionConfig::new(1, Direction::Client, TransportMode::Stream, key(1), key(2));
+        let mut config = SessionConfig::new(
+            1,
+            Direction::Client,
+            TransportMode::Datagram,
+            key(1),
+            key(2),
+        );
         config.low_entropy_mode = Some(1);
         let session = Session::new(config).unwrap();
         assert_eq!(session.max_fragment(), LOW_ENTROPY_MODE1_FRAGMENT);

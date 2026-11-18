@@ -25,7 +25,7 @@ use shadowlemon_crypto::{
     aead::AeadKey,
     envelope::{HandshakeRequest, HandshakeResponse, STATUS_NO_SUITE},
     hint::write_user_hint,
-    kdf::{derive_session_keys_v4, derive_static_key, hash_password},
+    kdf::{derive_early_keys, derive_session_keys_v4, derive_static_key, hash_password},
     kex::EphemeralKeyPair,
     suite::Suite,
     CryptoError, WireNonce, DEFAULT_PROTOCOL_VERSION, HANDSHAKE_REQUEST_FIXED_LEN,
@@ -51,21 +51,19 @@ pub const TYPE_OPEN_SESSION_REQUEST: u8 = 2;
 pub const TYPE_OPEN_SESSION_RESPONSE: u8 = 3;
 
 /// Which framing rules the surrounding connection uses.
+///
+/// External transport is UDP-only, so every handshake message carries its own
+/// nonce. The enum is retained as an explicit parameter to the handshake state
+/// machine and for API compatibility.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandshakeTransport {
-    /// TCP/stream underlay: the first message of each cipher chain carries a
-    /// nonce; later messages use the implicit counter.
-    Stream,
     /// UDP/datagram underlay: every message carries its own nonce.
     Datagram,
 }
 
 impl HandshakeTransport {
     const fn payload_nonce(self) -> PayloadNonce {
-        match self {
-            Self::Stream => PayloadNonce::TcpIncrement,
-            Self::Datagram => PayloadNonce::UdpFlip,
-        }
+        PayloadNonce::UdpFlip
     }
 }
 
@@ -215,6 +213,10 @@ pub struct EstablishedHandshake {
     pub c2s_key: AeadKey,
     /// Server-to-client data key.
     pub s2c_key: AeadKey,
+    /// Early (0-RTT) client-to-server key derived from the static key.
+    pub early_c2s_key: AeadKey,
+    /// Early (0-RTT) server-to-client key derived from the static key.
+    pub early_s2c_key: AeadKey,
     /// Application bytes that followed the handshake prefix in the request.
     pub piggyback: Vec<u8>,
     /// Authenticated user name, when the peer is the client.
@@ -433,6 +435,21 @@ impl ClientHandshake {
             .saturating_sub(HANDSHAKE_REQUEST_FIXED_LEN + self.suites.len())
     }
 
+    /// Keys for 0-RTT early application data.
+    ///
+    /// These are derived only from the static key, the session id and the
+    /// envelope suite, so both peers can compute them from the first flight
+    /// before any X25519 exchange completes. Early data therefore has **no
+    /// forward secrecy**; only the post-handshake data keys do.
+    pub fn early_keys(&self) -> Result<(AeadKey, AeadKey), HandshakeError> {
+        let static_key = derive_static_key(&self.username, &self.credential, self.suites[0])?;
+        let (c2s, s2c) = derive_early_keys(static_key.as_slice(), self.session_id, self.suites[0])?;
+        Ok((
+            AeadKey::new(self.suites[0], c2s.as_slice())?,
+            AeadKey::new(self.suites[0], s2c.as_slice())?,
+        ))
+    }
+
     /// Deadline of the handshake, once it has been started.
     #[must_use]
     pub fn deadline(&self) -> Option<Instant> {
@@ -592,11 +609,14 @@ impl ClientHandshake {
             &shared,
             response.suite,
         )?;
+        let (early_c2s, early_s2c) = self.early_keys()?;
         let established = EstablishedHandshake {
             session_id: self.session_id,
             suite: response.suite,
             c2s_key: AeadKey::new(response.suite, c2s.as_slice())?,
             s2c_key: AeadKey::new(response.suite, s2c.as_slice())?,
+            early_c2s_key: early_c2s,
+            early_s2c_key: early_s2c,
             piggyback: trailing,
             user: None,
         };
@@ -652,6 +672,10 @@ pub enum ServerHandshakeResult {
         response: Vec<u8>,
         /// Ready-to-install data-plane keys.
         session: Box<EstablishedHandshake>,
+        /// Early (0-RTT) client-to-server key for the initial data frames.
+        early_c2s_key: Box<AeadKey>,
+        /// Early (0-RTT) server-to-client key for the initial reply frames.
+        early_s2c_key: Box<AeadKey>,
         /// Application data that followed the request prefix.
         piggyback: Vec<u8>,
         /// Authenticated user name.
@@ -754,6 +778,7 @@ impl ServerHandshake {
             .decryptor
             .static_key(auth.name(), auth.suite())
             .ok_or_else(|| HandshakeError::Authentication("lost envelope key".to_owned()))?;
+        let (early_c2s, early_s2c) = derive_early_keys(&static_key, self.session_id, auth.suite())?;
         let envelope = AeadCipher::new(AeadKey::new(auth.suite(), &static_key)?);
 
         let response_nonce = if self.transport == HandshakeTransport::Datagram {
@@ -850,11 +875,15 @@ impl ServerHandshake {
         self.state = ServerHandshakeState::Established;
         Ok(ServerHandshakeResult::Established {
             response: frame,
+            early_c2s_key: Box::new(AeadKey::new(auth.suite(), early_c2s.as_slice())?),
+            early_s2c_key: Box::new(AeadKey::new(auth.suite(), early_s2c.as_slice())?),
             session: Box::new(EstablishedHandshake {
                 session_id: self.session_id,
                 suite,
                 c2s_key: AeadKey::new(suite, c2s.as_slice())?,
                 s2c_key: AeadKey::new(suite, s2c.as_slice())?,
+                early_c2s_key: AeadKey::new(auth.suite(), early_c2s.as_slice())?,
+                early_s2c_key: AeadKey::new(auth.suite(), early_s2c.as_slice())?,
                 piggyback: Vec::new(),
                 user: Some(user.clone()),
             }),
@@ -1056,6 +1085,7 @@ mod tests {
                     session,
                     piggyback,
                     user,
+                    ..
                 } => {
                     assert_eq!(piggyback, b"piggyback");
                     assert_eq!(user, USER);
@@ -1083,14 +1113,14 @@ mod tests {
     }
 
     #[test]
-    fn stream_handshake_uses_implicit_chain_nonce() {
+    fn datagram_handshake_response_carries_explicit_nonce() {
         let (registry, decryptor) = test_registry(vec![]);
         let mut client = ClientHandshake::with_password(
             USER,
             PASSWORD.as_bytes(),
             vec![Suite::XChaCha20Poly1305],
             42,
-            HandshakeTransport::Stream,
+            HandshakeTransport::Datagram,
         )
         .unwrap();
         let mut server = ServerHandshake::new(
@@ -1098,7 +1128,7 @@ mod tests {
             decryptor,
             vec![],
             42,
-            HandshakeTransport::Stream,
+            HandshakeTransport::Datagram,
             None,
         )
         .unwrap();
@@ -1110,10 +1140,10 @@ mod tests {
             ServerHandshakeResult::Established { response, .. } => response,
             _ => panic!("unexpected result"),
         };
-        // In stream mode the response omits the explicit nonce.
+        // In datagram mode every message carries its own explicit nonce.
         assert_eq!(
             response.len(),
-            META_BLOCK_LEN + HANDSHAKE_RESPONSE_LEN + AEAD_TAG_LEN
+            WIRE_NONCE_LEN + META_BLOCK_LEN + HANDSHAKE_RESPONSE_LEN + AEAD_TAG_LEN
         );
         assert!(matches!(
             client.process_response(&response),

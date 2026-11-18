@@ -23,5 +23,6 @@ set -e
 # Load test library.
 source ./libtest.sh
 
-# Test socks5 proxy with UDP config.
+# Test the UDP-associate-oriented configuration. The external transport is
+# UDP-only; the "UDP" label is a SOCKS5 scenario tag kept for compatibility.
 run_socks5_test UDP server_udp.json client_udp.json client_udp_no_wait.json

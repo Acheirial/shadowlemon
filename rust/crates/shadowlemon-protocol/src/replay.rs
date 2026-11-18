@@ -1,7 +1,7 @@
-//! Replay protection for the three V0.2 traffic classes.
+//! Replay protection for the two V0.2 traffic classes.
 //!
-//! Each direction gets its own [`ReplayCache`]: TCP (domain 0), UDP c2s
-//! (domain 1) and UDP s2c (domain 2). Signatures are 64-bit FNV-1a hashes of
+//! Each direction gets its own [`ReplayCache`]: UDP c2s (domain 1) and UDP s2c
+//! (domain 2). Signatures are 64-bit FNV-1a hashes of
 //! `u32be(length) || domain || wire_nonce` (spec §8.1). The cache has two
 //! generations of `GENERATION_CAPACITY` signatures and rotates after a
 //! generation fills up or after `GENERATION_TTL` seconds.
@@ -31,8 +31,6 @@ pub const SHARD_COUNT: usize = 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(u8)]
 pub enum ReplayDomain {
-    /// TCP byte stream.
-    Tcp = 0,
     /// UDP client-to-server datagrams.
     UdpClientToServer = 1,
     /// UDP server-to-client datagrams.
@@ -49,8 +47,8 @@ impl ReplayDomain {
 
 /// Source of a packet, used for the retransmission exemption.
 ///
-/// A non-empty tag from the same source grants an exemption (UDP); an empty
-/// tag never does (TCP). The wire form is `family || ip || u16be(port)`, at
+/// A non-empty tag from the same source grants a retransmission exemption; an
+/// empty tag never does. The wire form is `family || ip || u16be(port)`, at
 /// most 19 bytes.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct SourceTag {
@@ -357,17 +355,21 @@ mod tests {
     #[test]
     fn signature_is_domain_separated_and_length_prefixed() {
         let nonce = [0x11u8; 24];
-        let a = compute_signature(ReplayDomain::Tcp, &nonce);
-        let b = compute_signature(ReplayDomain::UdpClientToServer, &nonce);
+        let a = compute_signature(ReplayDomain::UdpClientToServer, &nonce);
+        let b = compute_signature(ReplayDomain::UdpServerToClient, &nonce);
         assert_ne!(a, b);
-        assert_ne!(a, compute_signature(ReplayDomain::Tcp, &nonce[..23]));
+        assert_ne!(
+            a,
+            compute_signature(ReplayDomain::UdpClientToServer, &nonce[..23])
+        );
 
-        // FNV-1a over u32be(24), domain=0, then 24 identical bytes.
+        // FNV-1a over u32be(24), domain=1, then 24 identical bytes.
         let mut expected = 0xcbf2_9ce4_8422_2325_u64;
         for byte in 24_u32.to_be_bytes() {
             expected = (expected ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
         }
-        expected = expected.wrapping_mul(0x0100_0000_01b3);
+        expected = (expected ^ u64::from(ReplayDomain::UdpClientToServer.as_u8()))
+            .wrapping_mul(0x0100_0000_01b3);
         for byte in nonce {
             expected = (expected ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
         }
@@ -406,7 +408,7 @@ mod tests {
 
     #[test]
     fn rotation_keeps_previous_generation_then_forgets_it() {
-        let mut cache = ReplayCache::new(ReplayDomain::Tcp);
+        let mut cache = ReplayCache::new(ReplayDomain::UdpClientToServer);
         let old = sig(1);
         cache.record(old, SourceTag::EMPTY);
         assert_eq!(cache.check(old, SourceTag::EMPTY), ReplayDecision::Replay);
@@ -465,8 +467,8 @@ mod tests {
     }
 
     #[test]
-    fn tcp_empty_tag_has_no_exemption() {
-        let cache = ReplayCache::new(ReplayDomain::Tcp);
+    fn empty_tag_has_no_exemption() {
+        let cache = ReplayCache::new(ReplayDomain::UdpClientToServer);
         let signature = cache.signature(&[3u8; 24]);
         cache.record(signature, SourceTag::EMPTY);
         assert_eq!(
@@ -474,8 +476,8 @@ mod tests {
             ReplayDecision::Replay
         );
         assert!(cache.check(signature, SourceTag::EMPTY).is_replay());
-        // Even if a tag were attached, the TCP caller always looks up with an
-        // empty tag, so no duplicate can be exempted.
+        // A lookup with an empty tag never grants an exemption, even when the
+        // recorded tag came from a real source.
         cache.record(signature, SourceTag::from_ipv6([1; 16], 42));
         assert_eq!(
             cache.check(signature, SourceTag::EMPTY),

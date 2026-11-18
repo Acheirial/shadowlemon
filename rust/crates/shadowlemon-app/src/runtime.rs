@@ -196,10 +196,10 @@ fn endpoint_from_config(server: &shadowlemon_config::ServerEndpoint) -> Option<E
 }
 
 fn port_bindings(binding: &PortBinding) -> Vec<PortBindingSpec> {
+    // The external transport is UDP-only. TCP bindings are rejected during
+    // config validation; if one reaches here, skip it defensively.
     let protocol = match binding.protocol {
-        TransportProtocol::Tcp => TransportKind::Tcp,
         TransportProtocol::Udp => TransportKind::Udp,
-        TransportProtocol::UnknownTransportProtocol => return Vec::new(),
         _ => return Vec::new(),
     };
     let mut ports = Vec::new();
@@ -381,7 +381,7 @@ mod tests {
         let binding = PortBinding {
             port: None,
             port_range: Some("2012-2014".to_owned()),
-            protocol: TransportProtocol::Tcp,
+            protocol: TransportProtocol::Udp,
         };
         let ports = port_bindings(&binding);
         assert_eq!(ports.len(), 3);

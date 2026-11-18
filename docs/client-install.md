@@ -1,6 +1,8 @@
 # 客户端安装与配置
 
 > **本版本线协议版本为 4；两端必须使用同一版本，否则会话会在握手阶段失败。**
+>
+> **外部传输为 UDP-only**：所有端口绑定都必须使用 `"protocol": "UDP"`，TCP 绑定会被配置校验拒绝。SOCKS5 CONNECT（TCP 目标）通过 UDP 隧道的可靠层承载，UDP ASSOCIATE 走数据报。握手为 0-RTT：首包携带握手请求与 SOCKS5 请求（piggyback），使用静态密钥派生的 early key 加密；数据面读写会 gated 到前向安全密钥交换完成，early data 无前向安全。
 
 ## 下载 shadowlemon 客户端
 
@@ -72,11 +74,11 @@ shadowlemon client replace config <FILE>
                     "portBindings": [
                         {
                             "portRange": "2012-2022",
-                            "protocol": "TCP"
+                            "protocol": "UDP"
                         },
                         {
                             "port": 2027,
-                            "protocol": "TCP"
+                            "protocol": "UDP"
                         }
                     ]
                 }
@@ -105,10 +107,10 @@ shadowlemon client replace config <FILE>
 2. 在 `profiles` -> `user` -> `password` 属性中，填写密码。此处必须与代理服务器中的设置相同。
 3. 在 `profiles` -> `servers` -> `ipAddress` 属性中，填写代理服务器的公网地址。支持 IPv4 和 IPv6 地址。
 4. 【可选】如果你为代理服务器注册了域名，请在 `profiles` -> `servers` -> `domainName` 中填写域名。否则，请勿修改这个属性。
-5. 在 `profiles` -> `servers` -> `portBindings` -> `port` 中填写 shadowlemon server 监听的 TCP 或 UDP 端口号。这个端口号必须与代理服务器中的设置相同。如果想要监听连续的端口号，也可以改为使用 `portRange` 属性。
+5. 在 `profiles` -> `servers` -> `portBindings` -> `port` 中填写 shadowlemon server 监听的 UDP 端口号。这个端口号必须与代理服务器中的设置相同。如果想要监听连续的端口号，也可以改为使用 `portRange` 属性。`protocol` 只能填 `UDP`；TCP 外部传输已移除，填 `TCP` 会在配置校验时被拒绝。
 6. 【可选】请为 `profiles` -> `mtu` 属性指定一个从 1280 到 1500 之间的值，默认值为 1400。该值是 L3 MTU，即网络路径能够通过的最大 IP 报文长度；UDP 代理协议的有效载荷预算会在此基础上另外扣除 IP 报文头与 UDP 报文头（IPv6 下最多 48 字节）。这个值必须与代理服务器相同；只有两端取值一致，才能避免因分片导致的性能下降。
 7. 【可选】如果想要调整多路复用的频率，是更多地创建新连接，还是更多地重用旧连接，可以为 `profiles` -> `multiplexing` -> `level` 属性设定一个值。这里可以使用的值包括 `MULTIPLEXING_OFF`, `MULTIPLEXING_LOW`, `MULTIPLEXING_MIDDLE`, `MULTIPLEXING_HIGH`。其中 `MULTIPLEXING_OFF` 会关闭多路复用功能。默认值为 `MULTIPLEXING_LOW`。
-8. 【可选】如果想开启 0-RTT 握手，请将 `profiles` -> `handshakeMode` 属性的值设置为 `HANDSHAKE_NO_WAIT`，否则请设置为 `HANDSHAKE_STANDARD`。默认值为 `HANDSHAKE_STANDARD`。
+8. 【可选】`profiles` -> `handshakeMode` 可选 `HANDSHAKE_STANDARD`、`HANDSHAKE_DEFAULT`、`HANDSHAKE_NO_WAIT`。V0.2 中三种模式都使用 0-RTT 握手（首包 piggyback + early key），因此该选项仅作兼容保留；数据面读写会 gated 到前向安全 key swap 完成，early data 无前向安全。默认值为 `HANDSHAKE_STANDARD`。
 9. 【可选】`profiles` -> `cipherSuites` 属性是客户端愿意使用的密码套件列表，**第一个元素最优先**。可以使用的值包括 `CIPHER_SUITE_XCHACHA20_POLY1305`，`CIPHER_SUITE_AES_256_GCM` 和 `CIPHER_SUITE_AES_128_GCM`。**未设置或者设置为空列表时，客户端只使用 `CIPHER_SUITE_XCHACHA20_POLY1305`**。会话最终使用的套件由客户端与服务端在握手时协商决定，规则和适用场景见[密码套件](../rust/docs/protocol-v0.2.md#2-密码套件与密钥)。列表的第 0 项还决定保护握手请求（信封）的静态密钥的密钥长度，但服务端挑选最终套件时**不**按密钥长度过滤，因此把 `CIPHER_SUITE_AES_128_GCM` 排在首位不会排除另外两种套件（详见[版本与套件协商](../rust/docs/protocol-v0.2.md#34-版本与套件协商)）。
 10. 请为 `socks5Port` 属性指定一个从 1025 到 65535 之间的数值。
 11. 【可选】如果客户端需要为局域网中的其他设备提供代理服务，请将 `socks5ListenLAN` 属性设置为 `true`。
@@ -194,6 +196,8 @@ Chrome / Firefox 等浏览器可以通过安装插件，使用 socks5 代理访�
 
 ### 通过 socks5 代理连接 shadowlemon 服务器
 
+> **与 UDP-only 传输不兼容**：外部传输现已只支持 UDP，而前置 socks5 代理的 UDP ASSOCIATE 尚未实现（返回明确的 "unsupported" 错误）。因此 `dialer` 无法用于连接 shadowlemon 服务器，不应在新配置中使用。`configs/examples/client_config_with_dialer.json` 已移除 `dialer` 块，作为可直接使用的 UDP-only 示例。以下字段说明仅为兼容旧配置的加载而保留。
+
 如果 shadowlemon 客户端必须通过已有的 socks5 代理连接 shadowlemon 服务器，可以在客户端 profile 中添加 `dialer` 对象。没有 `dialer` 的已有 profile 会继续直接连接服务器。
 
 ```js
@@ -224,7 +228,7 @@ Chrome / Firefox 等浏览器可以通过安装插件，使用 socks5 代理访�
 
 当前只支持 `SOCKS5_PROXY_PROTOCOL`。`host` 和 `port` 必须填写。`socks5Authentication` 是可选的；如果填写，则 `user` 和 `password` 都必须设置。
 
-将 `socks5UDPAssociate` 设置为 `true`，可以通过 socks5 UDP ASSOCIATE 连接 shadowlemon 代理服务器。如果它为 `false` 或未填写，UDP 流量不会通过 socks5 代理。
+将 `socks5UDPAssociate` 设置为 `true`，理论上可以通过 socks5 UDP ASSOCIATE 连接 shadowlemon 代理服务器，但目前上游 UDP ASSOCIATE 未实现，该路径会返回 "unsupported" 错误。因此本功能在 UDP-only 版本下不可用。
 
 ### socks5 用户名和密码验证
 
@@ -300,7 +304,7 @@ shadowlemon://<base64 编码的客户端配置>
 使用指令 `shadowlemon client export config simple` 生成人类可读的简单分享链接。例如：
 
 ```
-shadowlemons://user1:password1@1.2.3.4?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400&multiplexing=MULTIPLEXING_HIGH&port=6666&port=10000-10001&port=10002&port=10003&profile=default&protocol=TCP&protocol=TCP&protocol=UDP&protocol=UDP
+shadowlemons://user1:password1@1.2.3.4?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400&multiplexing=MULTIPLEXING_HIGH&port=6666&port=10000-10001&port=10002&port=10003&profile=default&protocol=UDP&protocol=UDP&protocol=UDP&protocol=UDP
 ```
 
 简单分享链接的格式如下：
@@ -321,7 +325,7 @@ shadowlemons://user1:password1@1.2.3.4?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400
 - `port`
 - `protocol`
 
-其中 `profile` 必须出现一次，`mtu`、`multiplexing`、`handshake-mode` 以及 `cipher-suites` 最多出现一次，`port` 和 `protocol` 可以出现多次，且它们出现的次数必须相同，以便将同一位置上的 `port` 和 `protocol` 联系起来。另外 `port` 也可以用来指定一段连续的端口。
+其中 `profile` 必须出现一次，`mtu`、`multiplexing`、`handshake-mode` 以及 `cipher-suites` 最多出现一次，`port` 和 `protocol` 可以出现多次，且它们出现的次数必须相同，以便将同一位置上的 `port` 和 `protocol` 联系起来。另外 `port` 也可以用来指定一段连续的端口。`protocol` 只能是 `UDP`；含 `TCP` 的链接会被校验拒绝。
 
 `cipher-suites` 的值是用逗号分隔的套件枚举名列表，顺序即客户端的偏好顺序，例如 `cipher-suites=CIPHER_SUITE_XCHACHA20_POLY1305,CIPHER_SUITE_AES_256_GCM`。如果 profile 设置了 `cipherSuites`，`shadowlemon client export config simple` 生成的链接中就会包含该参数；链接中省略该参数等同于未设置 `cipherSuites`，即客户端只使用 `CIPHER_SUITE_XCHACHA20_POLY1305`。如果列表中含有无法识别的套件名，或者其中含有 `CIPHER_SUITE_UNSPECIFIED`，`shadowlemon client import config <URL>` 会报错。
 
@@ -340,10 +344,10 @@ shadowlemons://user1:password1@1.2.3.4?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400
             "portBindings":  [
                 {
                     "port":  6666,
-                    "protocol":  "TCP"
+                    "protocol":  "UDP"
                 },
                 {
-                    "protocol":  "TCP",
+                    "protocol":  "UDP",
                     "portRange":  "10000-10001"
                 },
                 {

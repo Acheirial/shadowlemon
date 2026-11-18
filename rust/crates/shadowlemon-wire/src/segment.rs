@@ -8,12 +8,9 @@
 //! [padding 2]
 //! ```
 //!
-//! The 24-byte nonce is present on the first message of every TCP cipher
-//! chain and on every UDP datagram; subsequent TCP messages omit it and the
-//! receiver reconstructs it from the implicit nonce chain. Metadata and
-//! payload are sealed with the same key but different nonces: by flipping byte
-//! 16 of the wire nonce for UDP, or by incrementing the 24-byte big-endian
-//! counter for TCP. The caller can also supply both nonces explicitly (for
+//! The 24-byte nonce is carried on every UDP datagram. Metadata and payload
+//! are sealed with the same key but different nonces: by flipping byte 16 of
+//! the wire nonce. The caller can also supply both nonces explicitly (for
 //! example from the crypto crate's chain state).
 //!
 //! All AEAD work goes through [`Cipher`], a small trait defined here so the
@@ -49,8 +46,6 @@ pub trait Cipher {
 pub enum PayloadNonce {
     /// UDP: XOR byte 16 of the metadata nonce with `0x01`.
     UdpFlip,
-    /// TCP implicit chain: add one to the 24-byte big-endian metadata nonce.
-    TcpIncrement,
     /// Use a nonce supplied by the caller (for example from a crypto chain).
     Explicit(WireNonce),
 }
@@ -65,7 +60,6 @@ impl PayloadNonce {
                 nonce[PAYLOAD_NONCE_INDEX] ^= PAYLOAD_NONCE_MASK;
                 nonce
             }
-            Self::TcpIncrement => increment_nonce(metadata_nonce),
             Self::Explicit(nonce) => nonce,
         }
     }
@@ -165,7 +159,7 @@ impl Default for EncodeOptions {
 pub struct DecodeOptions {
     /// Whether the frame carries an explicit 24-byte wire nonce.
     pub include_nonce: bool,
-    /// Metadata nonce to use when the frame omits it (TCP implicit chain).
+    /// Metadata nonce to use when the frame omits it.
     pub implicit_metadata_nonce: WireNonce,
     /// How to derive the payload nonce.
     pub payload_nonce: PayloadNonce,
@@ -529,27 +523,6 @@ mod tests {
     }
 
     #[test]
-    fn tcp_implicit_nonce_omits_nonce() {
-        let cipher = TestCipher;
-        let options = EncodeOptions {
-            include_nonce: false,
-            payload_nonce: PayloadNonce::TcpIncrement,
-        };
-        let frame = encode_segment(&cipher, &golden_segment(), &options).unwrap();
-        assert_eq!(frame.len(), 32 + 16 + 2 + 4 + 16 + 1);
-        assert_eq!(&frame[..4], &META_PLAIN[..4]);
-
-        let decode_options = DecodeOptions {
-            include_nonce: false,
-            implicit_metadata_nonce: NONCE,
-            payload_nonce: PayloadNonce::TcpIncrement,
-        };
-        let decoded = decode_segment(&cipher, &frame, &decode_options).unwrap();
-        assert_eq!(decoded, golden_segment());
-        assert_eq!(decoded.wire_nonce, NONCE);
-    }
-
-    #[test]
     fn empty_payload_has_no_tag() {
         let cipher = TestCipher;
         let segment = Segment::new(M::session(4, 1, 2, 0, 3), NONCE, Vec::new());
@@ -624,7 +597,6 @@ mod tests {
         let mut next = nonce;
         next[WIRE_NONCE_LEN - 1] = 0x11;
         assert_eq!(increment_nonce(&nonce), next);
-        assert_eq!(PayloadNonce::TcpIncrement.derive(&nonce), next);
 
         let mut carry = [0u8; WIRE_NONCE_LEN];
         carry[22] = 0xff;
