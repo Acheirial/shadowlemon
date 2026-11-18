@@ -93,8 +93,8 @@ fuzz:
 fuzz-list:
 	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && cargo fuzz list
 
-# Size-optimized embedded build: uses the `embedded` profile and feature.
-# Add --target <triple> for cross compilation (see rust/docs/platform-notes.md).
+# Size-optimized Linux embedded build: uses the `embedded` profile and feature.
+# The --no-default-features flag is required to drop low-entropy.
 .PHONY: rust-embedded
 rust-embedded:
 	cd rust && export PATH="$$HOME/.cargo/bin:$$PATH" && cargo build --profile embedded --no-default-features --features embedded

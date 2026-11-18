@@ -13,8 +13,6 @@ default = []
 # crate has no such facilities, so this flag only changes the propagated
 # feature set; it is kept for a uniform binary feature graph.
 embedded = []
-android = []
-windows = []
 
 [dependencies]
 aead.workspace = true

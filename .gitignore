@@ -2,7 +2,6 @@
 rust/target/
 rust/fuzz/target/
 **/*.rs.bk
-*.pdb
 
 # Build outputs
 bin/

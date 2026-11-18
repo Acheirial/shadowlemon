@@ -3,9 +3,7 @@
 //! Every datagram carries its own 24-byte `wireNonce`; the payload is sealed
 //! with the byte-16-flipped nonce returned by the crypto crate's
 //! `udp_payload_nonce`. Sockets are created through `socket2` so `SO_REUSEADDR`
-//! can be set before `bind` on Unix. On Windows the option is deliberately a
-//! no-op (`platform-notes.md` §a.1), because `SO_REUSEADDR` there permits port
-//! hijacking.
+//! can be set before `bind`.
 //!
 //! The listener rebuild delay follows `reference-go-v3.md` §3.4: 1, 2, 4, 8,
 //! 16, 30 seconds with `[delay/2, delay]` jitter.
@@ -56,15 +54,8 @@ impl Default for PacketConfig {
 }
 
 /// Set socket options before binding.
-#[cfg(unix)]
 fn apply_socket_options(socket: &Socket) -> std::io::Result<()> {
     socket.set_reuse_address(true)
-}
-
-/// Windows intentionally does not set `SO_REUSEADDR` (`platform-notes.md` §a.1).
-#[cfg(not(unix))]
-fn apply_socket_options(_socket: &Socket) -> std::io::Result<()> {
-    Ok(())
 }
 
 fn bind_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {

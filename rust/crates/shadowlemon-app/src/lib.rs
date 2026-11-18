@@ -6,7 +6,7 @@
 //! the real cryptographic mux drivers in `shadowlemon_protocol::driver`.
 //!
 //! `platform` is the only module containing `unsafe`; it needs POSIX signal
-//! registration and Android's `SCM_RIGHTS` call.
+//! registration and `kill(2)`.
 
 pub mod config;
 pub mod platform;

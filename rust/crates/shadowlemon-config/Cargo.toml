@@ -10,8 +10,6 @@ repository.workspace = true
 [features]
 default = []
 embedded = []
-android = []
-windows = []
 # Low-entropy traffic shaping in the protocol layer is feature-gated. When this
 # feature is off, a configuration that requests a non-OFF low entropy mode is
 # rejected by validation.

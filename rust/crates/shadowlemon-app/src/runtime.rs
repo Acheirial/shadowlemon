@@ -68,13 +68,6 @@ pub async fn run_client(path: PathBuf, stop: &'static AtomicI32) -> Result<(), A
         Box::new(RealClientHandshake::new(driver_config).map_err(AppError::Io)?),
     )
     .map_err(|error| AppError::Config(error.to_string()))?;
-    if let Some(path) = std::env::var_os("SHADOWLEMON_PROTECT_PATH") {
-        debug!(?path, "socket protector path configured");
-    }
-    // On Android this hands sockets to the VPN service before connect; on all
-    // other targets it is a no-op.
-    let _protector = platform::default_protector();
-
     if let Some(dialer) = profile.dialer.as_ref() {
         mux.set_upstream(Arc::new(UpstreamSocks5::new(dialer)?))
             .await;

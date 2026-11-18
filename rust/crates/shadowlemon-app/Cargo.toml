@@ -24,18 +24,6 @@ embedded = [
     "shadowlemon-socks5/embedded",
     "shadowlemon-wire/embedded",
 ]
-android = [
-    "shadowlemon-config/android",
-    "shadowlemon-protocol/android",
-    "shadowlemon-socks5/android",
-    "shadowlemon-wire/android",
-]
-windows = [
-    "shadowlemon-config/windows",
-    "shadowlemon-protocol/windows",
-    "shadowlemon-socks5/windows",
-    "shadowlemon-wire/windows",
-]
 
 [dependencies]
 clap.workspace = true

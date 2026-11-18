@@ -8,15 +8,14 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Desktop/server builds accept the low-entropy mode used by the example
-# configurations. Use `--no-default-features --features embedded` for routers.
+# Linux desktop/server builds accept the low-entropy mode used by the example
+# configurations. Use `--no-default-features --features embedded` for size
+# constrained Linux routers.
 default = ["low-entropy"]
 low-entropy = ["shadowlemon-app/low-entropy"]
-# Small single-binary build for routers and mobile devices: no egress/DNS,
-# no low-entropy nonce support and no verbose logging.
+# Small single-binary build for Linux routers: no egress/DNS, no low-entropy
+# nonce support and no verbose logging.
 embedded = ["shadowlemon-app/embedded"]
-android = ["shadowlemon-app/android"]
-windows = ["shadowlemon-app/windows"]
 
 [[bin]]
 name = "shadowlemon"

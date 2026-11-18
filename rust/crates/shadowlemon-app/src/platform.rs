@@ -1,14 +1,11 @@
-//! Daemon, pidfile, signal and socket-protection plumbing.
+//! Daemon, pidfile and signal plumbing for Linux.
 //!
-//! Unix follows `rust/docs/platform-notes.md`: the child is started in its own
-//! process group, pidfiles are created atomically and carry the Linux
-//! `/proc/<pid>/stat` start time as an identity token, and stopping sends
-//! SIGTERM before escalating to SIGKILL. Windows uses detached processes and
-//! `taskkill` for compatibility. Android can additionally pass sockets to the
-//! VPN service over a Unix domain socket with `SCM_RIGHTS`.
+//! The child is started in its own process group, pidfiles are created
+//! atomically and carry the Linux `/proc/<pid>/stat` start time as an identity
+//! token, and stopping sends SIGTERM before escalating to SIGKILL.
 //!
 //! This is the only module that uses `unsafe`: POSIX signal registration and
-//! `sendmsg` for `SCM_RIGHTS` have no safe std/restricted-crate equivalent.
+//! `kill(2)` have no safe std equivalent.
 
 use std::{
     fs, io,
@@ -27,16 +24,13 @@ extern "C" fn record_signal(signal: i32) {
     STOP_SIGNAL.store(signal, Ordering::SeqCst);
 }
 
-/// Install SIGINT/SIGTERM handlers (no-op off Unix) and return the shared flag.
+/// Install SIGINT/SIGTERM handlers and return the shared flag.
 pub fn install_signal_handlers() -> &'static AtomicI32 {
-    #[cfg(unix)]
-    {
-        // SAFETY: `record_signal` only writes to an `AtomicI32`, which is
-        // async-signal-safe, and the handler has no captured state.
-        unsafe {
-            libc::signal(libc::SIGINT, record_signal as *const () as usize);
-            libc::signal(libc::SIGTERM, record_signal as *const () as usize);
-        }
+    // SAFETY: `record_signal` only writes to an `AtomicI32`, which is
+    // async-signal-safe, and the handler has no captured state.
+    unsafe {
+        libc::signal(libc::SIGINT, record_signal as *const () as usize);
+        libc::signal(libc::SIGTERM, record_signal as *const () as usize);
     }
     &STOP_SIGNAL
 }
@@ -44,97 +38,6 @@ pub fn install_signal_handlers() -> &'static AtomicI32 {
 /// Whether a shutdown signal was observed.
 pub fn shutdown_requested(flag: &AtomicI32) -> bool {
     flag.load(Ordering::SeqCst) != 0
-}
-
-/// Interface used by dialers to hand a freshly created socket to the platform
-/// (for example an Android VPN service) before connecting.
-pub trait SocketProtector: Send + Sync + std::fmt::Debug {
-    /// Protect `fd`; returns whether a protector actually handled it.
-    fn protect(&self, fd: i32, peer: Option<&std::net::SocketAddr>) -> io::Result<bool>;
-}
-
-/// Desktop/server/embedded no-op implementation.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoopProtector;
-
-impl SocketProtector for NoopProtector {
-    fn protect(&self, _fd: i32, _peer: Option<&std::net::SocketAddr>) -> io::Result<bool> {
-        Ok(false)
-    }
-}
-
-/// Pick the platform protector, honouring `SHADOWLEMON_PROTECT_PATH` on Android.
-pub fn default_protector() -> std::sync::Arc<dyn SocketProtector> {
-    #[cfg(all(unix, target_os = "android", feature = "android"))]
-    {
-        if let Some(path) = std::env::var_os("SHADOWLEMON_PROTECT_PATH") {
-            return std::sync::Arc::new(UnixSocketProtector {
-                path: PathBuf::from(path),
-            });
-        }
-    }
-    std::sync::Arc::new(NoopProtector)
-}
-
-/// Android protector using `SCM_RIGHTS` over `SHADOWLEMON_PROTECT_PATH`.
-#[cfg(all(unix, target_os = "android", feature = "android"))]
-#[derive(Debug)]
-struct UnixSocketProtector {
-    path: PathBuf,
-}
-
-#[cfg(all(unix, target_os = "android", feature = "android"))]
-impl SocketProtector for UnixSocketProtector {
-    fn protect(&self, fd: i32, _peer: Option<&std::net::SocketAddr>) -> io::Result<bool> {
-        use std::{
-            io::{Read, Write},
-            mem,
-            os::fd::AsRawFd,
-            ptr,
-        };
-        let stream = std::os::unix::net::UnixStream::connect(&self.path)?;
-        let byte = [1u8];
-        let iov = libc::iovec {
-            iov_base: byte.as_ptr() as *mut libc::c_void,
-            iov_len: byte.len(),
-        };
-        let mut control =
-            vec![0u8; unsafe { libc::CMSG_SPACE(mem::size_of::<libc::c_int>() as u32) as usize }];
-        let mut message = libc::msghdr {
-            msg_name: ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: &iov as *const libc::iovec as *mut libc::iovec,
-            msg_iovlen: 1,
-            msg_control: control.as_mut_ptr() as *mut libc::c_void,
-            msg_controllen: control.len(),
-            msg_flags: 0,
-        };
-        // SAFETY: `message` points at live, correctly aligned buffers; the
-        // control buffer is CMSG_SPACE bytes long, so the header and its data
-        // slot are inside the allocation.
-        unsafe {
-            let header = libc::CMSG_FIRSTHDR(&message);
-            if header.is_null() {
-                return Err(io::Error::other("no SCM_RIGHTS control header"));
-            }
-            (*header).cmsg_level = libc::SOL_SOCKET;
-            (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len = libc::CMSG_LEN(mem::size_of::<libc::c_int>() as u32) as _;
-            ptr::copy_nonoverlapping(
-                &fd as *const libc::c_int,
-                libc::CMSG_DATA(header) as *mut libc::c_int,
-                1,
-            );
-            if libc::sendmsg(stream.as_raw_fd(), &message, 0) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        let mut reply = [0u8; 1];
-        let mut stream = stream;
-        stream.write_all(&byte)?;
-        let read = stream.read(&mut reply)?;
-        Ok(read == 1 && reply[0] == 1)
-    }
 }
 
 /// PID file path for a mode, mirroring the Go deployment contract.
@@ -146,15 +49,12 @@ pub fn pid_path(mode: Mode) -> Result<PathBuf, AppError> {
 }
 
 fn process_identity() -> String {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(stat) = fs::read_to_string("/proc/self/stat") {
-            // Field 22 (starttime) follows the parenthesised command name.
-            if let Some(close) = stat.rfind(')') {
-                let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-                if let Some(starttime) = fields.get(19) {
-                    return (*starttime).to_owned();
-                }
+    if let Ok(stat) = fs::read_to_string("/proc/self/stat") {
+        // Field 22 (starttime) follows the parenthesised command name.
+        if let Some(close) = stat.rfind(')') {
+            let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+            if let Some(starttime) = fields.get(19) {
+                return (*starttime).to_owned();
             }
         }
     }
@@ -162,51 +62,24 @@ fn process_identity() -> String {
 }
 
 fn identity_of(pid: i32) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let close = stat.rfind(')')?;
-        let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-        fields.get(19).map(|value| (*value).to_owned())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
-    }
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    fields.get(19).map(|value| (*value).to_owned())
 }
 
 fn process_alive(pid: i32) -> bool {
-    #[cfg(unix)]
-    {
-        // SAFETY: `kill` with signal 0 only checks permissions/liveness.
-        unsafe { libc::kill(pid, 0) == 0 || *libc::__errno_location() == libc::EPERM }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+    // SAFETY: `kill` with signal 0 only checks permissions/liveness.
+    unsafe { libc::kill(pid, 0) == 0 || *libc::__errno_location() == libc::EPERM }
 }
 
 fn send_signal(pid: i32, signal: i32) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        // SAFETY: `signal` is a plain number; no memory is passed.
-        let result = unsafe { libc::kill(pid, signal) };
-        if result < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+    // SAFETY: `signal` is a plain number; no memory is passed.
+    let result = unsafe { libc::kill(pid, signal) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
     }
-    #[cfg(not(unix))]
-    {
-        let code = if signal == 9 { "/F" } else { "" };
-        Command::new("taskkill")
-            .args([code, "/PID", &pid.to_string()])
-            .status()?;
-        Ok(())
-    }
+    Ok(())
 }
 
 fn read_pidfile(path: &PathBuf) -> Result<(i32, String), AppError> {
@@ -225,18 +98,10 @@ fn matches_process(pid: i32, identity: &str) -> bool {
     if !process_alive(pid) {
         return false;
     }
-    #[cfg(target_os = "linux")]
-    {
-        if identity.is_empty() {
-            return true;
-        }
-        identity_of(pid).as_deref() == Some(identity)
+    if identity.is_empty() {
+        return true;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (pid, identity);
-        true
-    }
+    identity_of(pid).as_deref() == Some(identity)
 }
 
 /// Guard held by `run` while it owns the pidfile.
@@ -326,7 +191,6 @@ pub fn start_daemon(mode: Mode) -> Result<(), AppError> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);

@@ -28,8 +28,8 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/Acheirial/shadowlemon"
 
 # All third party versions live here so that every crate uses exactly the same
-# dependency graph. The `embedded` / `android` / `windows` features are
-# declared by each crate and forwarded by the binary; Cargo unifies them.
+# dependency graph. The `embedded` feature is declared by each crate and
+# forwarded by the binary; Cargo unifies them.
 [workspace.dependencies]
 # crypto
 aead = { version = "0.6", features = ["alloc"] }

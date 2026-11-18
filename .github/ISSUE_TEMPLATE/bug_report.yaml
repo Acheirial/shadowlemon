@@ -6,12 +6,11 @@ body:
       label: 操作系统
       description: 操作系统类型
       options:
-        - Windows
-        - MacOS
-        - Linux
-        - Android
-        - iOS
-        - 其他
+        - Debian / Ubuntu
+        - RHEL / CentOS / Fedora
+        - Arch Linux
+        - Alpine Linux
+        - 其他 Linux 发行版
     validations:
       required: true
   - type: input

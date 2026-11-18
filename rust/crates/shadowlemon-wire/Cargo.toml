@@ -13,8 +13,6 @@ default = []
 # default so normal builds never carry the extra transform code.
 low-entropy = []
 embedded = []
-android = []
-windows = []
 
 [dependencies]
 thiserror.workspace = true

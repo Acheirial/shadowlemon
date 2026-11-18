@@ -10,8 +10,6 @@ repository.workspace = true
 [features]
 default = []
 embedded = []
-android = []
-windows = []
 
 [dependencies]
 bytes.workspace = true

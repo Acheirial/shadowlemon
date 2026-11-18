@@ -72,10 +72,8 @@ fn warn_json_once() {
 
 /// Return the per-user ShadowLemon configuration directory.
 ///
-/// Uses [`dirs::config_dir`], which resolves to:
-/// - Linux/BSD: `~/.config/shadowlemon` (respecting `XDG_CONFIG_HOME`)
-/// - macOS: `~/Library/Application Support/shadowlemon`
-/// - Windows: `%AppData%\shadowlemon`
+/// Uses [`dirs::config_dir`], which resolves to `~/.config/shadowlemon` on
+/// Linux (respecting `XDG_CONFIG_HOME`).
 pub fn config_dir() -> Result<PathBuf> {
     dirs::config_dir()
         .map(|dir| dir.join("shadowlemon"))
