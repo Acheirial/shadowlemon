@@ -136,6 +136,18 @@ rust-clippy: clippy
 rust-fuzz: fuzz
 rust-fuzz-list: fuzz-list
 
+# Offline OpenGFW FET evaluator / evasion-prefix search (research tool).
+# Set PCAP=<file> for the check/scan targets; see tools/gfw-search.md.
+GSEARCH ?= /tmp/opencode/gfw-search
+PCAP ?=
+.PHONY: gfw-search gfw-search-check gfw-search-scan
+gfw-search:
+	export PATH="$$HOME/.cargo/bin:$$PATH" && rustc -O tools/gfw-search.rs -o $(GSEARCH)
+gfw-search-check: gfw-search
+	$(GSEARCH) check $(PCAP)
+gfw-search-scan: gfw-search
+	$(GSEARCH) search $(PCAP) 20 128
+
 # Remove build outputs.
 .PHONY: clean
 clean:
