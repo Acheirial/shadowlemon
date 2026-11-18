@@ -1,6 +1,6 @@
 # ShadowLemon V0.2 流量特征分析与整改报告
 
-> 本报告基于源码级静态审计与整改前后的真实抓包对比。抓包在 `unshare -Urnm` 用户/网络/挂载命名空间内完成（命名空间内可执行 tcpdump 并可写 `/var/run/shadowlemon`），使用同一份配置分别运行整改前（`7be03ce`）与整改后（`7cfe986`）二进制，由 `sockshttpclient` / `socksudpclient` 产生流量。
+> 本报告基于源码级静态审计、整改前后的真实抓包对比，以及 nDPI 6.0 检测测试。抓包在 `unshare -Urnm` 用户/网络/挂载命名空间内完成（命名空间内可执行 tcpdump 并可写 `/var/run/shadowlemon`），使用同一份配置分别运行整改前（`7be03ce`）与整改后（`7cfe986`）二进制，由 `sockshttpclient` / `socksudpclient` 产生流量。nDPI 为 Homebrew Linux 安装的 6.0.0（`/home/linuxbrew/.linuxbrew/bin/ndpiReader`，需设置 `LD_LIBRARY_PATH`）。
 
 ## 1. 结论摘要
 
@@ -48,13 +48,30 @@ V0.2 的密码学设计是扎实的：TCP 上无明文 magic / 版本 / 类型 /
 
 > UDP 压测客户端因已知的半双工回复缺口（`known-gaps.md` §1）出现超时，故整改后样本量较小（193 包），但首字节取值与会话 ID 的结论不受影响。
 
+## 3.3 nDPI 6.0 检测测试
+
+对四份 pcap（TCP/UDP × 整改前后）运行 `ndpiReader`：
+
+| 场景 | 流数 | nDPI 判定 | 置信度来源 | `Susp Entropy` 风险 |
+|---|---|---|---|---|
+| TCP 整改前 | 60 | **TPLINK_SHP**（IoT-Scada）100% | `Match by port` 60 | 100% |
+| TCP 整改后 | 60 | **TPLINK_SHP**（IoT-Scada）100% | `Match by port` 60 | 100% |
+| UDP 整改前 | 3 | **TPLINK_SHP** 100% | `Match by port` 3 | 100% |
+| UDP 整改后 | 1 | **TPLINK_SHP** 100% | `Match by port` 1 | 100% |
+
+**结论**：nDPI 没有 ShadowLemon 特征，因此"检测率"这个概念在当前场景下不成立——它把流量 100% 判为 `TPLINK_SHP` 纯粹是因为默认监听端口 9999/10000 命中了 TP-Link 智能家居协议的已知端口，属于**端口误报**，与协议内容无关。整改前后判定完全一致，说明我们的加固不影响 nDPI（它根本没看内容）。
+
+**验证与建议**：把服务端监听端口改为非知名端口（如 23456）后重新抓包，`ndpiReader` 把全部 20 个流判为 **`Unknown`**（`Confidence: Unknown`），TPLINK_SHP 误报消失。因此**避免使用 9999/10000 等知名端口**是消除 nDPI 误报的直接措施。
+
+`Susp Entropy` 风险在全部场景 100% 命中：这是任何无 cover 协议的加密代理都会触发的高熵启发式，单靠随机填充无法消除，除非外层套 TLS/HTTP 等伪装。
+
 ## 4. 残余指纹（未闭环）
 
 1. **握手响应定长**：TCP 115 字节 / UDP 144 字节，因客户端读取端依赖定长约定；需改为先读 48 字节元数据、解密取长度后再读变长部分。
 2. **重传逐字节相同**：`session.rs` 重传复用同一密文帧；可用新 nonce 重加密或追加随机填充。
 3. **心跳时序**：空闲 TCP 每 3–14 秒发空 ACK，空闲 UDP 不发；可被时序分类识别。
 4. **UDP `kind` 混淆不是加密**：协议感知的观察者仍可用会话 ID 反推消息类型；真正的路由元数据保密需要握手协商密钥。
-5. **nDPI 检测率未测**：环境未安装 nDPI（无 `ndpiReader` / `libndpi`）。建议在具备软件的环境用上述 pcap 做 before/after 检测率对比。
+5. **nDPI 的 `Susp Entropy` 风险标记未消除**：100% 流被命中，因为这是高熵加密流量的通用启发式。要消除需外层 cover 协议（TLS/HTTP 伪装），不在当前 V0.2 范围内。端口误报可通过换非知名端口规避（见 §3.3）。
 
 ## 5. 参考方法论
 
